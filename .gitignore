@@ -1,0 +1,10 @@
+# Optional project-local MitoHPC installation
+/software/
+
+# Workflow state and common SLURM logs if output is placed in this checkout
+/.mito-pipeline/
+*.out
+*.err
+
+# MitoHPC installation diagnostics
+checkInstall.log
