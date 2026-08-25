@@ -220,12 +220,6 @@ that worker mistakenly continues into variant calling on a sample's first
 copy-number-only run. The wrapper creates the same `.idxstats` and `.count`
 inputs directly, then uses MitoHPC's cohort copy-number summarizer.
 
-## Replacing the old scripts
-
-`qrun_mhpc_copyme.qsub` and the original `extract_chrM.sh` targeted Grid Engine
-and contained hard-coded paths. They are retained only as migration pointers;
-new work should use `mito_pipeline.sh`.
-
 ## License
 
 This project is distributed under the GNU General Public License, version 3.

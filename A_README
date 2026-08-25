@@ -1,6 +1,0 @@
-See README.md.
-
-New installations: ./setup_mitohpc.sh
-New runs:          ./mito_pipeline.sh INPUT_DIR OUTPUT_DIR
-
-The old Grid Engine scripts have been replaced by a resumable SLURM workflow.
