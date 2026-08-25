@@ -18,6 +18,13 @@ load_job_config() {
         source "$PROLOGUE"
         set -u
     fi
+    # setup_mitohpc.sh installs MitoHPC prerequisites under ../bin. Put those
+    # pinned tools ahead of anything loaded by the optional cluster prologue.
+    local mitohpc_bin
+    mitohpc_bin=$(cd -- "$MITOHPC_SCRIPTS/../bin" 2>/dev/null && pwd -P) || mitohpc_bin=''
+    if [[ -n "$mitohpc_bin" ]]; then
+        export PATH="$mitohpc_bin:$PATH"
+    fi
 }
 
 load_manifest_row() {
@@ -43,6 +50,9 @@ initialize_mitohpc() {
     # shellcheck disable=SC1090
     source "$init_script"
     set -u
+    if [[ -n "${HP_BDIR:-}" && -d "$HP_BDIR" ]]; then
+        export PATH="$HP_BDIR:$PATH"
+    fi
     export HP_IN="$MANIFEST"
     export HP_ODIR="$OUTPUT_DIR"
     export HP_ADIR="$(dirname -- "$ALIGNMENT")"

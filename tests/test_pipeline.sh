@@ -10,7 +10,7 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 assert_file() { [[ -e "$1" ]] || fail "missing $1"; }
 assert_grep() { grep -F -- "$1" "$2" >/dev/null || fail "'$1' not found in $2"; }
 
-mkdir -p "$TEST_DIR/input" "$TEST_DIR/out" "$TEST_DIR/mitohpc/scripts" "$TEST_DIR/mitohpc/RefSeq" "$TEST_DIR/bin"
+mkdir -p "$TEST_DIR/input" "$TEST_DIR/out" "$TEST_DIR/mitohpc/scripts" "$TEST_DIR/mitohpc/RefSeq" "$TEST_DIR/mitohpc/bin" "$TEST_DIR/bin"
 printf 'bam-data\n' > "$TEST_DIR/input/alpha.bam"
 printf 'index-data\n' > "$TEST_DIR/input/alpha.bai"
 printf '>chrM\nACGT\n' > "$TEST_DIR/mitohpc/RefSeq/hs38DH.fa"
@@ -70,6 +70,9 @@ printf '%s\n' \
     '  *) exit 2 ;;' \
     'esac' \
     > "$TEST_DIR/bin/samtools"
+cp "$TEST_DIR/bin/samtools" "$TEST_DIR/mitohpc/bin/samtools"
+# A broken system samtools proves workers prefer MitoHPC's bundled executable.
+printf '%s\n' '#!/usr/bin/env bash' 'exit 99' > "$TEST_DIR/bin/samtools"
 
 printf '%s\n' \
     '#!/usr/bin/env bash' \
@@ -96,7 +99,7 @@ printf '%s\n' \
     'for ((i = 0; i < ${SQUEUE_TEST_ACTIVE:-0}; i++)); do printf "%s\n" "$((9000 + i))"; done' \
     > "$TEST_DIR/bin/squeue"
 
-chmod +x "$TEST_DIR/mitohpc/scripts/"* "$TEST_DIR/bin/"*
+chmod +x "$TEST_DIR/mitohpc/scripts/"* "$TEST_DIR/mitohpc/bin/samtools" "$TEST_DIR/bin/"*
 
 # Submission test: accepts the alternate sample.bai name, stages the canonical
 # name MitoHPC needs, and submits worker + summary + extraction.

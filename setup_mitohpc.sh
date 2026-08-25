@@ -81,4 +81,6 @@ set -u
 ./install_prerequisites.sh
 ./checkInstall.sh
 [[ -f checkInstall.log ]] && cat checkInstall.log
+[[ -x "$install_dir/bin/samtools" ]] || \
+    die "MitoHPC setup did not install its bundled samtools: $install_dir/bin/samtools"
 log 'MitoHPC setup complete'

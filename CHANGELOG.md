@@ -16,6 +16,8 @@ All notable changes to this project are documented here.
 - Explicitly request one node per SLURM task and improve policy-error reporting.
 - Resolve helper scripts from the shared repository path instead of SLURM's
   temporary spool directory.
+- Prefer MitoHPC's bundled `bin/samtools` in compute jobs and verify it during
+  setup, avoiding a dependency on cluster module state.
 
 ## v0.1.0 — 2026-08-25
 

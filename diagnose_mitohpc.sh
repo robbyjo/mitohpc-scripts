@@ -158,6 +158,13 @@ for command_name in sbatch squeue sacct batchlim jobhist samtools; do
 done
 command -v sbatch >/dev/null 2>&1 && show_command sbatch --version
 command -v batchlim >/dev/null 2>&1 && show_command batchlim
+bundled_samtools="$pipeline_dir/software/MitoHPC/bin/samtools"
+if [[ -x "$bundled_samtools" ]]; then
+    printf 'bundled_samtools=%s\n' "$bundled_samtools"
+    show_command "$bundled_samtools" --version
+else
+    printf 'MISSING_BUNDLED_SAMTOOLS=%s\n' "$bundled_samtools"
+fi
 
 section 'Currently pending or running jobs'
 if command -v squeue >/dev/null 2>&1; then

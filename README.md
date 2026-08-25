@@ -74,6 +74,10 @@ Use `./mito_pipeline.sh --help` for all resource and analysis options. If your
 cluster needs modules or other site initialization, put those commands in a
 small shell file and pass `--prologue /path/to/cluster_env.sh`.
 
+Compute jobs automatically prefer tools installed in MitoHPC's `bin/`
+directory, including its bundled `samtools`. A cluster module or prologue is
+only needed when that bundled executable is absent or unusable.
+
 ## Extracting mitochondrial sequences
 
 Extraction is optional; a run without `--extract-mt` performs MitoHPC analysis
