@@ -9,9 +9,12 @@ source "$HERE/job_common.sh"
 if [[ "${1:-}" == --index ]]; then
     load_job_config "${2:-}"
     task_id=${SLURM_ARRAY_TASK_ID:-}
+    offset=${3:-0}
     [[ "$task_id" =~ ^[0-9]+$ ]] || job_die 'SLURM_ARRAY_TASK_ID is missing or invalid'
-    row=$(sed -n "$((task_id + 1))p" "$INDEX_MANIFEST")
-    [[ -n "$row" ]] || job_die "array index $task_id is outside the index manifest"
+    [[ "$offset" =~ ^[0-9]+$ ]] || job_die 'index manifest offset is invalid'
+    manifest_index=$((task_id + offset))
+    row=$(sed -n "$((manifest_index + 1))p" "$INDEX_MANIFEST")
+    [[ -n "$row" ]] || job_die "array index $task_id with offset $offset is outside the index manifest"
     IFS=$'\t' read -r sample alignment index <<< "$row"
     [[ -n "$sample" && -n "$alignment" && -n "$index" ]] || job_die "malformed index manifest row for task $task_id"
     [[ -s "$alignment" ]] || job_die "alignment disappeared for $sample: $alignment"
@@ -47,7 +50,7 @@ if [[ "${1:-}" == --index ]]; then
 fi
 
 load_job_config "${1:-}"
-load_manifest_row
+load_manifest_row "${2:-0}"
 
 ok_file="$STATUS_DIR/mitohpc/$SAMPLE.ok"
 input_signature=$(alignment_signature)

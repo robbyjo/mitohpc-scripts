@@ -40,8 +40,11 @@ SLURM options:
   --cpus N                  CPUs per sample (default: 4)
   --memory SIZE             Memory per sample, e.g. 16G (default: 16G)
   --tool-memory SIZE        Per-process/tool memory limit (default: 3G)
-  --time D-HH:MM:SS         Time per sample (default: 2-00:00:00)
-  --max-parallel N          Maximum simultaneous array tasks (default: 50)
+  --time D-HH:MM:SS         Time per array task (default: 2-00:00:00)
+  --max-parallel N          Maximum simultaneous array tasks (default: 20)
+  --max-array-size N        Maximum tasks in one array (default: 1000)
+  --max-user-jobs N         Association submit-job limit (default: 1000)
+  --job-headroom N          Job slots reserved for other work (default: 20)
   --partition NAME          SLURM partition
   --account NAME            SLURM account
   --qos NAME                SLURM QoS
@@ -129,7 +132,10 @@ cpus=4
 memory='16G'
 tool_memory='3G'
 walltime='2-00:00:00'
-max_parallel=50
+max_parallel=20
+max_array_size=1000
+max_user_jobs=1000
+job_headroom=20
 partition=''
 account=''
 qos=''
@@ -142,7 +148,7 @@ create_indexes=1
 positional=()
 while (($#)); do
     case "$1" in
-        --mitohpc-dir|--reference-profile|--reference-fasta|--mt-contig|--caller|--iterations|--max-mt-reads|--min-depth|--cpus|--memory|--tool-memory|--time|--max-parallel|--partition|--account|--qos|--mail-user|--mail-type|--prologue)
+        --mitohpc-dir|--reference-profile|--reference-fasta|--mt-contig|--caller|--iterations|--max-mt-reads|--min-depth|--cpus|--memory|--tool-memory|--time|--max-parallel|--max-array-size|--max-user-jobs|--job-headroom|--partition|--account|--qos|--mail-user|--mail-type|--prologue)
             (($# >= 2)) || die "$1 requires a value"
             option=$1
             value=$2
@@ -161,6 +167,9 @@ while (($#)); do
                 --tool-memory) tool_memory=$value ;;
                 --time) walltime=$value ;;
                 --max-parallel) max_parallel=$value ;;
+                --max-array-size) max_array_size=$value ;;
+                --max-user-jobs) max_user_jobs=$value ;;
+                --job-headroom) job_headroom=$value ;;
                 --partition) partition=$value ;;
                 --account) account=$value ;;
                 --qos) qos=$value ;;
@@ -192,6 +201,10 @@ output_dir=${positional[1]}
 [[ "$min_depth" =~ ^[1-9][0-9]*$ ]] || die 'min-depth must be a positive integer'
 [[ "$cpus" =~ ^[1-9][0-9]*$ ]] || die 'cpus must be a positive integer'
 [[ "$max_parallel" =~ ^[1-9][0-9]*$ ]] || die 'max-parallel must be a positive integer'
+[[ "$max_array_size" =~ ^[1-9][0-9]*$ ]] || die 'max-array-size must be a positive integer'
+[[ "$max_user_jobs" =~ ^[1-9][0-9]*$ ]] || die 'max-user-jobs must be a positive integer'
+[[ "$job_headroom" =~ ^[0-9]+$ ]] || die 'job-headroom must be a non-negative integer'
+((job_headroom < max_user_jobs)) || die 'job-headroom must be smaller than max-user-jobs'
 [[ "$memory" =~ ^[1-9][0-9]*([KMGTP])?$ ]] || die 'memory must look like 16000M or 16G'
 [[ "$tool_memory" =~ ^[1-9][0-9]*([KMGTP])?$ ]] || die 'tool-memory must look like 3000M or 3G'
 [[ "$walltime" =~ ^([0-9]+-)?[0-9]{1,2}:[0-9]{2}(:[0-9]{2})?$ ]] || die 'time must look like HH:MM:SS or D-HH:MM:SS'
@@ -239,6 +252,9 @@ command -v find >/dev/null 2>&1 || die 'find is required'
 command -v cksum >/dev/null 2>&1 || die 'cksum is required'
 command -v stat >/dev/null 2>&1 || die 'GNU stat is required'
 command -v awk >/dev/null 2>&1 || die 'awk is required'
+for helper in bundle_array.sh job_common.sh mitohpc_array.sh extract_array.sh summary.sh; do
+    [[ -r "$SCRIPT_DIR/slurm/$helper" ]] || die "required pipeline helper is not readable: $SCRIPT_DIR/slurm/$helper"
+done
 
 state_dir="$output_dir/.mito-pipeline"
 staging_dir="$state_dir/alignments"
@@ -255,11 +271,12 @@ if ((!dry_run)); then
     command -v squeue >/dev/null 2>&1 || die 'squeue is not available'
     while IFS= read -r previous_metadata; do
         for job_key in index_array_job mitohpc_array_job extract_array_job; do
-            previous_job=$(awk -F '\t' -v key="$job_key" '$1 == key {print $2; exit}' "$previous_metadata")
-            [[ "$previous_job" =~ ^[0-9]+$ ]] || continue
-            previous_state=$(squeue -h -j "$previous_job" -o '%T' 2>/dev/null | head -n 1)
-            [[ -z "$previous_state" ]] || \
-                die "job $previous_job is still $previous_state for this output directory; wait before resubmitting"
+            while IFS= read -r previous_job; do
+                [[ "$previous_job" =~ ^[0-9]+$ ]] || continue
+                previous_state=$(squeue -h -j "$previous_job" -o '%T' 2>/dev/null | head -n 1)
+                [[ -z "$previous_state" ]] || \
+                    die "job $previous_job is still $previous_state for this output directory; wait before resubmitting"
+            done < <(awk -F '\t' -v key="$job_key" '$1 == key {print $2}' "$previous_metadata")
         done
     done < <(find "$runs_dir" -mindepth 2 -maxdepth 2 -name run.txt -type f -print)
 fi
@@ -383,7 +400,43 @@ if ((dry_run)); then
     exit 0
 fi
 
-common_sbatch=(--parsable --export=ALL --cpus-per-task="$cpus" --mem="$memory" --time="$walltime")
+planned_jobs_for_bundle() {
+    local size=$1 planned=0
+    ((${#missing_indexes[@]} == 0)) || planned=$((planned + (${#missing_indexes[@]} + size - 1) / size))
+    ((extract_only)) || planned=$((planned + (sample_count + size - 1) / size + 1))
+    ((extract_mt)) && planned=$((planned + (sample_count + size - 1) / size))
+    printf '%s\n' "$planned"
+}
+
+queue_user=${USER:-}
+[[ -n "$queue_user" ]] || queue_user=$(id -un)
+active_job_count=$(squeue -h -r -u "$queue_user" -o '%i' 2>/dev/null | awk 'NF {count++} END {print count + 0}')
+available_job_slots=$((max_user_jobs - job_headroom - active_job_count))
+minimum_pipeline_jobs=$(planned_jobs_for_bundle "$sample_count")
+if ((available_job_slots < minimum_pipeline_jobs)); then
+    die "only $available_job_slots submit-job slot(s) remain ($active_job_count active, limit $max_user_jobs, headroom $job_headroom); wait for jobs to finish or lower --job-headroom"
+fi
+
+low=1
+high=$sample_count
+while ((low < high)); do
+    middle=$(((low + high) / 2))
+    if (($(planned_jobs_for_bundle "$middle") <= available_job_slots)); then
+        high=$middle
+    else
+        low=$((middle + 1))
+    fi
+done
+bundle_size=$low
+planned_job_count=$(planned_jobs_for_bundle "$bundle_size")
+printf 'bundle_size\t%s\nactive_jobs_at_submit\t%s\nplanned_jobs\t%s\n' \
+    "$bundle_size" "$active_job_count" "$planned_job_count" >> "$metadata"
+if ((bundle_size > 1)); then
+    log "submit-job quota: bundling up to $bundle_size samples per task ($planned_job_count new jobs, $active_job_count already active, limit $max_user_jobs)"
+    log "--time applies to the whole bundle; use --partition nhlbi and a suitable --time if bundled samples need longer"
+fi
+
+common_sbatch=(--parsable --export=ALL --nodes=1 --cpus-per-task="$cpus" --mem="$memory" --time="$walltime")
 [[ -z "$partition" ]] || common_sbatch+=(--partition="$partition")
 [[ -z "$account" ]] || common_sbatch+=(--account="$account")
 [[ -z "$qos" ]] || common_sbatch+=(--qos="$qos")
@@ -391,85 +444,111 @@ if [[ -n "$mail_user" ]]; then
     common_sbatch+=(--mail-user="$mail_user" --mail-type="$mail_type")
 fi
 
-array_range="0-$((sample_count - 1))%$max_parallel"
-index_job=''
-mitohpc_job=''
-extract_job=''
+run_sbatch() {
+    local output
+    if ! output=$(sbatch "$@" 2>&1); then
+        printf 'ERROR: sbatch failed: %s\n' "$output" >&2
+        if [[ "$output" == *AssocMaxSubmitJobLimit* ]]; then
+            printf 'ERROR: the association submit-job quota changed or filled after preflight; wait for jobs to finish or lower --max-user-jobs.\n' >&2
+        fi
+        return 1
+    fi
+    printf '%s\n' "$output"
+}
+
+make_array_spec() {
+    local count=$1 parallel=$max_parallel
+    ((parallel <= count)) || parallel=$count
+    if ((count == 1)); then
+        printf '0%%%s\n' "$parallel"
+    else
+        printf '0-%s%%%s\n' "$((count - 1))" "$parallel"
+    fi
+}
+
+join_job_ids() {
+    local separator=$1
+    shift
+    (IFS="$separator"; printf '%s' "$*")
+}
+
+submit_chunked_arrays() {
+    local -n result_jobs=$1
+    local total=$2 stage=$3 job_name=$4 log_prefix=$5 metadata_key=$6 base_dependency=$7
+    local offset items count array_spec dependency job_id previous_job=''
+    local dependency_arg=()
+    local max_items_per_array=$((max_array_size * bundle_size))
+    for ((offset = 0; offset < total; offset += max_items_per_array)); do
+        items=$((total - offset))
+        ((items <= max_items_per_array)) || items=$max_items_per_array
+        count=$(((items + bundle_size - 1) / bundle_size))
+        array_spec=$(make_array_spec "$count")
+        dependency=$base_dependency
+        if [[ -n "$previous_job" ]]; then
+            [[ -z "$dependency" ]] || dependency+=','
+            dependency+="afterany:$previous_job"
+        fi
+        dependency_arg=()
+        [[ -z "$dependency" ]] || dependency_arg+=(--dependency="$dependency")
+        job_id=$(run_sbatch "${common_sbatch[@]}" "${dependency_arg[@]}" \
+            --job-name="$job_name" \
+            --array="$array_spec" \
+            --output="$logs_dir/${log_prefix}_%A_%a.out" \
+            --error="$logs_dir/${log_prefix}_%A_%a.err" \
+            "$SCRIPT_DIR/slurm/bundle_array.sh" "$SCRIPT_DIR/slurm" "$stage" "$config" "$offset" "$bundle_size" "$total")
+        job_id=${job_id%%;*}
+        [[ "$job_id" =~ ^[0-9]+$ ]] || die "could not parse $job_name job ID: $job_id"
+        result_jobs+=("$job_id")
+        printf '%s\t%s\n' "$metadata_key" "$job_id" >> "$metadata"
+        log "submitted $job_name array job $job_id: --array=$array_spec, manifest offset $offset, bundle size $bundle_size"
+        previous_job=$job_id
+    done
+}
+
+index_jobs=()
+mitohpc_jobs=()
+extract_jobs=()
 summary_job=''
 if ((${#missing_indexes[@]})); then
-    index_range="0-$((${#missing_indexes[@]} - 1))%$max_parallel"
-    index_job=$(sbatch "${common_sbatch[@]}" \
-        --job-name=alignment_index \
-        --array="$index_range" \
-        --output="$logs_dir/index_%A_%a.out" \
-        --error="$logs_dir/index_%A_%a.err" \
-        "$SCRIPT_DIR/slurm/mitohpc_array.sh" --index "$config")
-    index_job=${index_job%%;*}
-    [[ "$index_job" =~ ^[0-9]+$ ]] || die "could not parse indexing job ID: $index_job"
-    printf 'index_array_job\t%s\n' "$index_job" >> "$metadata"
-    log "submitted alignment indexing array job $index_job"
+    submit_chunked_arrays index_jobs "${#missing_indexes[@]}" index alignment_index index index_array_job ''
 fi
+
+index_afterok=''
+((${#index_jobs[@]} == 0)) || index_afterok="afterok:$(join_job_ids : "${index_jobs[@]}")"
 if ((!extract_only)); then
-    mitohpc_dependency=()
-    [[ -z "$index_job" ]] || mitohpc_dependency+=(--dependency="afterok:$index_job")
-    mitohpc_job=$(sbatch "${common_sbatch[@]}" "${mitohpc_dependency[@]}" \
-        --job-name=mitohpc \
-        --array="$array_range" \
-        --output="$logs_dir/mitohpc_%A_%a.out" \
-        --error="$logs_dir/mitohpc_%A_%a.err" \
-        "$SCRIPT_DIR/slurm/mitohpc_array.sh" "$config")
-    mitohpc_job=${mitohpc_job%%;*}
-    [[ "$mitohpc_job" =~ ^[0-9]+$ ]] || die "could not parse MitoHPC job ID: $mitohpc_job"
-    printf 'mitohpc_array_job\t%s\n' "$mitohpc_job" >> "$metadata"
-    log "submitted MitoHPC array job $mitohpc_job"
+    submit_chunked_arrays mitohpc_jobs "$sample_count" mitohpc mitohpc mitohpc mitohpc_array_job "$index_afterok"
 fi
 
 if ((extract_mt)); then
-    extract_dependency=()
     extract_dependencies=()
-    [[ -z "$index_job" ]] || extract_dependencies+=("afterok:$index_job")
-    ((extract_only)) || extract_dependencies+=("afterany:$mitohpc_job")
-    ((${#extract_dependencies[@]} == 0)) || extract_dependency+=(--dependency="$(IFS=,; printf '%s' "${extract_dependencies[*]}")")
-    extract_job=$(sbatch "${common_sbatch[@]}" "${extract_dependency[@]}" \
-        --job-name=extract_mt \
-        --array="$array_range" \
-        --output="$logs_dir/extract_%A_%a.out" \
-        --error="$logs_dir/extract_%A_%a.err" \
-        "$SCRIPT_DIR/slurm/extract_array.sh" "$config")
-    extract_job=${extract_job%%;*}
-    [[ "$extract_job" =~ ^[0-9]+$ ]] || die "could not parse extraction job ID: $extract_job"
-    printf 'extract_array_job\t%s\n' "$extract_job" >> "$metadata"
-    if ((extract_only)); then
-        log "submitted mitochondrial extraction array job $extract_job"
-    else
-        log "submitted extraction array job $extract_job after MitoHPC job $mitohpc_job"
-    fi
+    [[ -z "$index_afterok" ]] || extract_dependencies+=("$index_afterok")
+    ((extract_only)) || extract_dependencies+=("afterany:${mitohpc_jobs[-1]}")
+    extract_base_dependency=$(join_job_ids , "${extract_dependencies[@]}")
+    submit_chunked_arrays extract_jobs "$sample_count" extract extract_mt extract extract_array_job "$extract_base_dependency"
 fi
-
 if ((!extract_only)); then
-    summary_sbatch=(--parsable --export=ALL --cpus-per-task=1 --mem=8G --time=04:00:00)
+    summary_sbatch=(--parsable --export=ALL --nodes=1 --cpus-per-task=1 --mem=8G --time=04:00:00)
     [[ -z "$partition" ]] || summary_sbatch+=(--partition="$partition")
     [[ -z "$account" ]] || summary_sbatch+=(--account="$account")
     [[ -z "$qos" ]] || summary_sbatch+=(--qos="$qos")
     if [[ -n "$mail_user" ]]; then
         summary_sbatch+=(--mail-user="$mail_user" --mail-type="$mail_type")
     fi
-    summary_dependency="afterok:$mitohpc_job"
-    ((extract_mt)) && summary_dependency+=",afterany:$extract_job"
-    summary_job=$(sbatch "${summary_sbatch[@]}" \
+    summary_dependency="afterok:$(join_job_ids : "${mitohpc_jobs[@]}")"
+    ((extract_mt)) && summary_dependency+=",afterany:${extract_jobs[-1]}"
+    summary_job=$(run_sbatch "${summary_sbatch[@]}" \
         --dependency="$summary_dependency" \
         --job-name=mitohpc_summary \
         --output="$logs_dir/summary_%j.out" \
         --error="$logs_dir/summary_%j.err" \
-        "$SCRIPT_DIR/slurm/summary.sh" "$config")
+        "$SCRIPT_DIR/slurm/summary.sh" "$SCRIPT_DIR/slurm" "$config")
     summary_job=${summary_job%%;*}
     [[ "$summary_job" =~ ^[0-9]+$ ]] || die "could not parse summary job ID: $summary_job"
     printf 'summary_job\t%s\n' "$summary_job" >> "$metadata"
     log "submitted dependent summary job $summary_job"
 fi
-
 printf 'Submitted %s samples.' "$sample_count"
-[[ -z "$index_job" ]] || printf ' Indexing job: %s;' "$index_job"
-((extract_only)) || printf ' MitoHPC job: %s; summary job: %s' "$mitohpc_job" "$summary_job"
-((extract_mt)) && printf '; extraction job: %s' "$extract_job"
+(( ${#index_jobs[@]} == 0 )) || printf ' Indexing jobs: %s;' "$(join_job_ids , "${index_jobs[@]}")"
+((extract_only)) || printf ' MitoHPC jobs: %s; summary job: %s' "$(join_job_ids , "${mitohpc_jobs[@]}")" "$summary_job"
+((extract_mt)) && printf '; extraction jobs: %s' "$(join_job_ids , "${extract_jobs[@]}")"
 printf '\nResults: %s\nLogs: %s\n' "$output_dir" "$logs_dir"

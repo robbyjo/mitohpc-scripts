@@ -22,12 +22,15 @@ load_job_config() {
 
 load_manifest_row() {
     local task_id=${SLURM_ARRAY_TASK_ID:-}
+    local offset=${1:-0}
     [[ "$task_id" =~ ^[0-9]+$ ]] || job_die 'SLURM_ARRAY_TASK_ID is missing or invalid'
+    [[ "$offset" =~ ^[0-9]+$ ]] || job_die 'manifest offset is invalid'
+    local manifest_index=$((task_id + offset))
     local row
-    row=$(sed -n "$((task_id + 1))p" "$MANIFEST")
-    [[ -n "$row" ]] || job_die "array index $task_id is outside the manifest"
+    row=$(sed -n "$((manifest_index + 1))p" "$MANIFEST")
+    [[ -n "$row" ]] || job_die "array index $task_id with offset $offset is outside the manifest"
     IFS=$'\t' read -r SAMPLE ALIGNMENT OUTPUT_PREFIX <<< "$row"
-    [[ -n "$SAMPLE" && -n "$ALIGNMENT" && -n "$OUTPUT_PREFIX" ]] || job_die "malformed manifest row for task $task_id"
+    [[ -n "$SAMPLE" && -n "$ALIGNMENT" && -n "$OUTPUT_PREFIX" ]] || job_die "malformed manifest row for task $task_id with offset $offset"
 }
 
 initialize_mitohpc() {
@@ -133,7 +136,8 @@ write_failure_status() {
         printf 'failed_utc\t%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
         printf 'exit_code\t%s\n' "$rc"
         printf 'job_id\t%s\n' "${SLURM_JOB_ID:-unknown}"
-        printf 'array_task_id\t%s\n' "${SLURM_ARRAY_TASK_ID:-unknown}"
+        printf 'array_task_id\t%s\n' "${MITO_PIPELINE_ARRAY_TASK_ID:-${SLURM_ARRAY_TASK_ID:-unknown}}"
+        printf 'manifest_index\t%s\n' "${MITO_PIPELINE_MANIFEST_INDEX:-unknown}"
         printf 'host\t%s\n' "$(hostname)"
     } > "$tmp"
     mv -f -- "$tmp" "$failed"
@@ -148,7 +152,8 @@ write_success_status() {
         printf 'workflow_signature\t%s\n' "$workflow_signature"
         printf 'input_signature\t%s\n' "$input_signature"
         printf 'job_id\t%s\n' "${SLURM_JOB_ID:-unknown}"
-        printf 'array_task_id\t%s\n' "${SLURM_ARRAY_TASK_ID:-unknown}"
+        printf 'array_task_id\t%s\n' "${MITO_PIPELINE_ARRAY_TASK_ID:-${SLURM_ARRAY_TASK_ID:-unknown}}"
+        printf 'manifest_index\t%s\n' "${MITO_PIPELINE_MANIFEST_INDEX:-unknown}"
         printf 'host\t%s\n' "$(hostname)"
     } > "$tmp"
     mv -f -- "$tmp" "$ok"

@@ -8,6 +8,14 @@ All notable changes to this project are documented here.
 - Keep generated indexes in pipeline staging so input directories remain
   untouched, and gate downstream jobs on successful indexing.
 - Add `--require-indexes` for the previous fail-fast behavior.
+- Split cohorts into sequential SLURM arrays with `--max-array-size`, avoiding
+  invalid array specifications while preserving the global concurrency cap.
+- Set scheduler-aware defaults of 1,000 tasks per array and 20 concurrent tasks.
+- Preflight active jobs and automatically bundle samples to respect
+  `AssocMaxSubmitJobLimit`, with configurable quota and headroom.
+- Explicitly request one node per SLURM task and improve policy-error reporting.
+- Resolve helper scripts from the shared repository path instead of SLURM's
+  temporary spool directory.
 
 ## v0.1.0 — 2026-08-25
 

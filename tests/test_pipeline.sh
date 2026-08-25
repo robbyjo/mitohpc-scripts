@@ -93,7 +93,7 @@ printf '%s\n' \
 
 printf '%s\n' \
     '#!/usr/bin/env bash' \
-    'exit 0' \
+    'for ((i = 0; i < ${SQUEUE_TEST_ACTIVE:-0}; i++)); do printf "%s\n" "$((9000 + i))"; done' \
     > "$TEST_DIR/bin/squeue"
 
 chmod +x "$TEST_DIR/mitohpc/scripts/"* "$TEST_DIR/bin/"*
@@ -112,7 +112,7 @@ assert_file "$TEST_DIR/out/.mito-pipeline/alignments/alpha.bam.bai"
 [[ $(wc -l < "$TEST_DIR/sbatch.log") -eq 3 ]] || fail 'expected three sbatch calls'
 assert_grep '--dependency=afterany:1001' "$TEST_DIR/sbatch.log"
 assert_grep '--dependency=afterok:1001,afterany:1002' "$TEST_DIR/sbatch.log"
-assert_grep 'MitoHPC job: 1001; summary job: 1003; extraction job: 1002' "$TEST_DIR/submit.stdout"
+assert_grep 'MitoHPC jobs: 1001; summary job: 1003; extraction jobs: 1002' "$TEST_DIR/submit.stdout"
 
 # A missing source index is created in output staging by a preliminary array;
 # MitoHPC and summary jobs wait for that array to succeed.
@@ -125,7 +125,7 @@ PATH="$TEST_DIR/bin:$PATH" SBATCH_TEST_LOG="$TEST_DIR/sbatch.log" SBATCH_TEST_CO
 [[ $(wc -l < "$TEST_DIR/sbatch.log") -eq 3 ]] || fail 'expected indexing, MitoHPC, and summary submissions'
 assert_grep '--job-name=alignment_index' "$TEST_DIR/sbatch.log"
 assert_grep '--dependency=afterok:1004' "$TEST_DIR/sbatch.log"
-assert_grep 'Indexing job: 1004; MitoHPC job: 1005; summary job: 1006' "$TEST_DIR/auto.stdout"
+assert_grep 'Indexing jobs: 1004; MitoHPC jobs: 1005; summary job: 1006' "$TEST_DIR/auto.stdout"
 auto_run_dir=$(find "$TEST_DIR/out-auto/.mito-pipeline/runs" -mindepth 1 -maxdepth 1 -type d | head -n 1)
 auto_config="$auto_run_dir/config.env"
 PATH="$TEST_DIR/bin:$PATH" SLURM_ARRAY_TASK_ID=0 SLURM_JOB_ID=2000 \
@@ -150,7 +150,73 @@ PATH="$TEST_DIR/bin:$PATH" SBATCH_TEST_LOG="$TEST_DIR/sbatch.log" SBATCH_TEST_CO
     --mitohpc-dir "$TEST_DIR/mitohpc" --extract-only --reference-fasta "$TEST_DIR/mitohpc/RefSeq/hs38DH.fa" \
     > "$TEST_DIR/extract-only.stdout"
 [[ $(wc -l < "$TEST_DIR/sbatch.log") -eq 1 ]] || fail 'extraction-only mode should submit one array'
-assert_grep 'extraction job: 1007' "$TEST_DIR/extract-only.stdout"
+assert_grep 'extraction jobs: 1007' "$TEST_DIR/extract-only.stdout"
+
+# A cohort larger than the site's 1,000-task array limit is split into
+# sequential arrays. The manifest offset passed to each worker preserves the
+# sample mapping, while %20 limits the total number of concurrent tasks.
+mkdir -p "$TEST_DIR/input-chunked"
+for sample_number in $(seq -w 0 1000); do
+    printf 'bam-data\n' > "$TEST_DIR/input-chunked/sample${sample_number}.bam"
+    printf 'index-data\n' > "$TEST_DIR/input-chunked/sample${sample_number}.bam.bai"
+done
+: > "$TEST_DIR/sbatch.log"
+PATH="$TEST_DIR/bin:$PATH" SBATCH_TEST_LOG="$TEST_DIR/sbatch.log" SBATCH_TEST_COUNTER="$TEST_DIR/sbatch.counter" \
+    "$ROOT/mito_pipeline.sh" "$TEST_DIR/input-chunked" "$TEST_DIR/out-chunked" \
+    --mitohpc-dir "$TEST_DIR/mitohpc" --max-array-size 1000 --max-parallel 20 --max-user-jobs 5000 \
+    > "$TEST_DIR/chunked.stdout"
+[[ $(wc -l < "$TEST_DIR/sbatch.log") -eq 3 ]] || fail 'expected two MitoHPC arrays and one summary submission'
+assert_grep '--array=0-999%20' "$TEST_DIR/sbatch.log"
+assert_grep '--array=0%1' "$TEST_DIR/sbatch.log"
+assert_grep '--dependency=afterany:1008' "$TEST_DIR/sbatch.log"
+assert_grep '--dependency=afterok:1008:1009' "$TEST_DIR/sbatch.log"
+assert_grep 'MitoHPC jobs: 1008,1009; summary job: 1010' "$TEST_DIR/chunked.stdout"
+chunked_run_dir=$(find "$TEST_DIR/out-chunked/.mito-pipeline/runs" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+chunked_config="$chunked_run_dir/config.env"
+PATH="$TEST_DIR/bin:$PATH" SLURM_ARRAY_TASK_ID=0 SLURM_JOB_ID=2010 \
+    "$ROOT/slurm/mitohpc_array.sh" "$chunked_config" 1000
+assert_file "$TEST_DIR/out-chunked/samples/sample1000/sample1000.filter-called"
+
+# MaxSubmitJobs counts every array element, including dependent stages. Bundle
+# samples so a combined analysis/extraction run fits within the available quota.
+mkdir -p "$TEST_DIR/input-quota"
+for sample_number in $(seq 0 5); do
+    printf 'bam-data\n' > "$TEST_DIR/input-quota/quota${sample_number}.bam"
+    printf 'index-data\n' > "$TEST_DIR/input-quota/quota${sample_number}.bam.bai"
+done
+: > "$TEST_DIR/sbatch.log"
+PATH="$TEST_DIR/bin:$PATH" SQUEUE_TEST_ACTIVE=2 SBATCH_TEST_LOG="$TEST_DIR/sbatch.log" SBATCH_TEST_COUNTER="$TEST_DIR/sbatch.counter" \
+    "$ROOT/mito_pipeline.sh" "$TEST_DIR/input-quota" "$TEST_DIR/out-quota" \
+    --mitohpc-dir "$TEST_DIR/mitohpc" --extract-mt \
+    --reference-fasta "$TEST_DIR/mitohpc/RefSeq/hs38DH.fa" \
+    --max-user-jobs 10 --job-headroom 2 > "$TEST_DIR/quota.stdout" 2> "$TEST_DIR/quota.stderr"
+[[ $(wc -l < "$TEST_DIR/sbatch.log") -eq 3 ]] || fail 'quota-aware run should submit analysis, extraction, and summary'
+[[ $(grep -c -- '--array=0-1%2' "$TEST_DIR/sbatch.log") -eq 2 ]] || fail 'quota-aware arrays were not bundled to two tasks each'
+assert_grep "$ROOT/slurm mitohpc" "$TEST_DIR/sbatch.log"
+assert_grep "$ROOT/slurm extract" "$TEST_DIR/sbatch.log"
+assert_grep 'bundling up to 3 samples per task' "$TEST_DIR/quota.stderr"
+assert_grep '2 already active, limit 10' "$TEST_DIR/quota.stderr"
+assert_grep '--dependency=afterok:1011,afterany:1012' "$TEST_DIR/sbatch.log"
+quota_run_dir=$(find "$TEST_DIR/out-quota/.mito-pipeline/runs" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+quota_config="$quota_run_dir/config.env"
+PATH="$TEST_DIR/bin:$PATH" SLURM_ARRAY_TASK_ID=1 SLURM_JOB_ID=2011 \
+    "$ROOT/slurm/bundle_array.sh" "$ROOT/slurm" mitohpc "$quota_config" 0 3 6
+assert_file "$TEST_DIR/out-quota/samples/quota3/quota3.filter-called"
+assert_file "$TEST_DIR/out-quota/samples/quota4/quota4.filter-called"
+assert_file "$TEST_DIR/out-quota/samples/quota5/quota5.filter-called"
+
+# SLURM copies submitted scripts into a spool directory without their sibling
+# files. Simulate that behavior and verify explicit repository-path resolution.
+mkdir -p "$TEST_DIR/spool"
+cp "$ROOT/slurm/bundle_array.sh" "$TEST_DIR/spool/slurm_script"
+cp "$ROOT/slurm/summary.sh" "$TEST_DIR/spool/summary_script"
+chmod +x "$TEST_DIR/spool/slurm_script" "$TEST_DIR/spool/summary_script"
+PATH="$TEST_DIR/bin:$PATH" SLURM_ARRAY_TASK_ID=0 SLURM_JOB_ID=2012 \
+    "$TEST_DIR/spool/slurm_script" "$ROOT/slurm" mitohpc "$quota_config" 0 1 6
+assert_file "$TEST_DIR/out-quota/samples/quota0/quota0.filter-called"
+PATH="$TEST_DIR/bin:$PATH" SLURM_JOB_ID=2013 \
+    "$TEST_DIR/spool/summary_script" "$ROOT/slurm" "$quota_config"
+assert_file "$TEST_DIR/out-quota/summary-called"
 
 run_dir=$(find "$TEST_DIR/out/.mito-pipeline/runs" -mindepth 1 -maxdepth 1 -type d | head -n 1)
 config="$run_dir/config.env"
@@ -161,7 +227,7 @@ PATH="$TEST_DIR/bin:$PATH" SLURM_ARRAY_TASK_ID=0 SLURM_JOB_ID=2001 \
     "$ROOT/slurm/mitohpc_array.sh" "$config"
 assert_file "$TEST_DIR/out/samples/alpha/alpha.filter-called"
 assert_file "$TEST_DIR/out/.mito-pipeline/status/mitohpc/alpha.ok"
-PATH="$TEST_DIR/bin:$PATH" SLURM_JOB_ID=2002 "$ROOT/slurm/summary.sh" "$config"
+PATH="$TEST_DIR/bin:$PATH" SLURM_JOB_ID=2002 "$ROOT/slurm/summary.sh" "$ROOT/slurm" "$config"
 assert_file "$TEST_DIR/out/summary-called"
 assert_file "$TEST_DIR/out/.mito-pipeline/status/summary.ok"
 

@@ -7,7 +7,7 @@ readonly HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$HERE/job_common.sh"
 
 load_job_config "${1:-}"
-load_manifest_row
+load_manifest_row "${2:-0}"
 
 ok_file="$STATUS_DIR/extract/$SAMPLE.ok"
 input_signature=$(alignment_signature)

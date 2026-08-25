@@ -19,6 +19,12 @@ workflow (`b172170323aa61dedbfb5f04002a732092843df5`) for reproducibility. It
 does **not** modify `~/.bashrc`. A different compatible checkout can be selected
 at run time with `--mitohpc-dir`.
 
+Keep the complete repository on a filesystem visible from both the login and
+compute nodes, and do not move it while jobs are active. SLURM copies each batch
+entry script into a temporary spool directory without its sibling files; the
+launcher therefore passes the original absolute `slurm/` directory to every
+job explicitly.
+
 The default analysis profile is MitoHPC's `init.sh` (hs38DH in the pinned
 release). Select another installed profile such as `init.mm39.sh` with
 `--reference-profile mm39`; the launcher verifies that the requested profile
@@ -46,7 +52,7 @@ Useful examples:
 
 # Recursively find files, limit concurrency, and use a site account/partition
 ./mito_pipeline.sh /data/wgs /results/mito --recursive \
-  --account my_lab --partition general --max-parallel 100
+  --account my_lab --partition general --max-parallel 20 --max-array-size 1000
 
 # Call variants and also retain an indexed mitochondrial-only CRAM
 ./mito_pipeline.sh /data/wgs /results/mito --extract-mt \
@@ -104,83 +110,118 @@ the selected MitoHPC profile.
 
 ## What gets submitted
 
-- One SLURM array task per sample. A failed sample does not cancel successful
-  samples.
-- When needed, one preliminary SLURM array task per missing BAM/CRAM index.
-  Downstream work waits for the entire indexing array to succeed.
-- With `--extract-mt`, a separate extraction array that starts after the
-  MitoHPC array finishes, whether or not every analysis task succeeded.
-- One summary job that runs only after the MitoHPC array succeeds and, when
-  extraction was requested, after the extraction array finishes.
+- Normally, one SLURM array task processes one sample. If the planned workflow
+  would exceed the association's submit-job quota, the launcher automatically
+  bundles several samples sequentially in each task. Failures are recorded per
+  sample, successful samples remain resumable, and the bundled task reports a
+  failure after attempting every assigned sample.
+- When needed, preliminary tasks create missing BAM/CRAM indexes. Downstream
+  work waits for all indexing arrays to succeed.
+- With `--extract-mt`, separate extraction arrays start after MitoHPC processing
+  finishes, whether or not every analysis task succeeded.
+- One summary job runs only after every MitoHPC array succeeds and, when
+  extraction was requested, after extraction finishes.
 
-The default per-sample request is 4 CPUs, 16 GB, and 2 days, with at most 50
-tasks running simultaneously. Change these with `--cpus`, `--memory`, `--time`,
-and `--max-parallel`. MitoHPC's Java heap and per-sort-thread memory are capped
-separately at 3 GB by default (`--tool-memory`), preventing four sort threads
-from each treating the full 16 GB SLURM allocation as their own limit.
+Every task explicitly requests one node. The default task request is 4 CPUs,
+16 GB, and 2 days, with at most 20 tasks running simultaneously and at most
+1,000 tasks in each array. Change these with `--cpus`, `--memory`, `--time`,
+`--max-parallel`, and `--max-array-size`. When bundling is active, `--time`
+covers all samples processed sequentially by that task, so select an appropriate
+partition and wall time.
+
+MitoHPC's Java heap and per-sort-thread memory are capped separately at 3 GB by
+default (`--tool-memory`), preventing four sort threads from each treating the
+full 16 GB SLURM allocation as their own limit.
 
 ## Scheduler concurrency limits
 
-Schedulers normally limit jobs or array tasks, not physical “servers.” Multiple
-tasks may share a node, and one task may reserve several CPUs. There are two
-different limits to consider:
+Schedulers limit jobs or array tasks, not physical “servers.” There are three
+separate limits:
 
-1. **Concurrent-task limit:** how many array tasks may run at the same time.
-2. **Array-size limit:** how many total tasks may be submitted in one array.
+1. **Concurrent-task limit:** how many array tasks may run at once. Controlled
+   by `--max-parallel` and SLURM's `%N` syntax.
+2. **Array-size limit:** how many tasks one array specification may contain.
+   Controlled by `--max-array-size`.
+3. **Submit-job limit:** how many running plus pending jobs the association may
+   have. Controlled here by `--max-user-jobs` and `--job-headroom`.
 
 ### SLURM (`sbatch`)
 
-Use `--max-parallel` to stay within the concurrent-task limit. For a site limit
-of 1,000 simultaneous tasks:
+The array defaults match:
 
-```bash
-./mito_pipeline.sh INPUT OUTPUT --max-parallel 1000
+```text
+sbatch --array=0-999%20
 ```
 
-For `N` samples, the launcher submits an array equivalent to
-`--array=0-(N-1)%1000`. All samples remain in the array, but SLURM runs no more
-than 1,000 of its tasks simultaneously. The remaining tasks stay pending and
-start as earlier tasks finish. This is throttling, not an attempt to bypass the
-cluster policy.
+However, `%20` limits only simultaneous execution. SLURM still enforces
+`MaxSubmitJobs` against every array element, including elements waiting on a
+dependency. Therefore, a 1,000-sample combined MitoHPC and extraction run can
+represent roughly 2,001 submitted jobs even though only 20 run at once. This is
+what produces `AssocMaxSubmitJobLimit`.
 
-For a combined `--extract-mt` run, the analysis and extraction arrays are
-sequenced rather than run concurrently. Therefore, `--max-parallel 1000` does
-not turn into 2,000 simultaneous array tasks. Separate launcher invocations use
-separate throttles and are not coordinated with one another; choose their
-individual limits so the total across all active runs remains within policy.
-
-If the 1,000-job limit includes other jobs owned by the same user, leave some
-headroom—for example, use `--max-parallel 900`. SLURM may apply an even lower
-account, partition, or QoS limit; in that case tasks simply remain pending. Use
-these commands to inspect the array and pending reasons:
+The launcher now counts the user's expanded running and pending array tasks
+before submission. With the defaults, it keeps total usage below a 1,000-job
+association limit and reserves 20 slots for other work:
 
 ```bash
-squeue -u "$USER"
-squeue -j ARRAY_JOB_ID -o '%.18i %.9T %.30R'
+./mito_pipeline.sh INPUT OUTPUT \
+  --max-parallel 20 --max-array-size 1000 \
+  --max-user-jobs 1000 --job-headroom 20
 ```
 
-The `%1000` throttle does **not** solve a maximum-array-size error. If the cohort
-contains more samples than the site's `MaxArraySize`, `sbatch` rejects the whole
-array before it starts. Check the configured value, when permitted, with:
+If necessary, it reduces the number of array tasks by assigning multiple
+samples to each task. For example, if analysis plus extraction would require
+2,001 job slots but only 980 are available, each task processes several samples
+sequentially. The run metadata records the selected bundle size. Separate
+launcher invocations can still race for the same quota; if the quota fills after
+preflight, the launcher stops with a targeted explanation and can be rerun.
+
+Use the cluster's current values rather than assuming them. On NIH Biowulf,
+`batchlim` reports the current maximum jobs, array size, partition wall times,
+and per-user allocations:
+
+```bash
+batchlim
+squeue -r -u "$USER"
+```
+
+For 5,708 indexed CRAMs and the stated NHLBI access, a combined copy-number and
+mitochondrial-extraction invocation is:
+
+```bash
+./mito_pipeline.sh INPUT OUTPUT --iterations 0 --extract-mt \
+  --partition nhlbi --time 10-00:00:00 \
+  --max-user-jobs 1000 --job-headroom 20
+```
+
+Assuming the queue is otherwise empty, the launcher selects a bundle size of 12
+for this combined run: 476 MitoHPC tasks, 476 extraction tasks, and one summary
+job, or 953 submitted jobs. A MitoHPC-only run uses a bundle size of 6: 952
+array tasks plus one summary job. Existing jobs or missing CRAM indexes reduce
+the available slots, so the actual bundle size is recalculated at submission
+and written to `OUTPUT/.mito-pipeline/runs/RUN/run.txt`.
+
+Increase `--time` only if the measured runtime of an automatically bundled task
+requires it, and never above the value currently shown by `batchlim`. The
+`norm` partition's single-node restriction is compatible with this workflow:
+each analysis, indexing, extraction, and summary task requests exactly one
+node. Choosing `nhlbi` changes eligible nodes and wall-time policy; it does not
+by itself remove an association submit-job limit.
+
+If your cluster reports a different `MaxArraySize`, pass it with
+`--max-array-size`. When permitted, inspect the SLURM configuration with:
 
 ```bash
 scontrol show config | grep -i MaxArraySize
 ```
 
-For a cohort larger than that value, divide the input into multiple directories
-with at most `MaxArraySize` alignments each and use a different output directory
-for each submission. Set the `--max-parallel` values so their combined
-concurrency remains below the 1,000-task site limit. Alternatively, ask the
-cluster administrators whether a larger array is permitted.
-
 ### Grid Engine-style `qsub`
 
-This workflow submits with SLURM `sbatch`; the retained `.qsub` filename is only
-a compatibility entry point and still calls the SLURM launcher. On a separate
-Grid Engine workflow, the comparable array concurrency control is usually
-`qsub -t 1-N -tc 1000`. Other systems also use a command named `qsub`—notably
-PBS—and their throttling syntax can differ, so check that scheduler's site
-documentation. Do not pass `qsub` options to `mito_pipeline.sh`.
+This workflow submits only with SLURM `sbatch`. In a separate Grid Engine
+workflow, comparable array concurrency control is commonly
+`qsub -t 1-N -tc 20`. Other schedulers also use a command named `qsub`, notably
+PBS, and their syntax can differ. Check the scheduler's site documentation; do
+not pass `qsub` options to `mito_pipeline.sh`.
 
 ## Output and recovery
 

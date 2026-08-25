@@ -2,11 +2,15 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+slurm_dir=${1:-}
+[[ -d "$slurm_dir" && -r "$slurm_dir/job_common.sh" ]] || {
+    printf 'ERROR: pipeline SLURM directory is not readable on compute node: %s\n' "$slurm_dir" >&2
+    exit 1
+}
 # shellcheck source=job_common.sh
-source "$HERE/job_common.sh"
+source "$slurm_dir/job_common.sh"
 
-load_job_config "${1:-}"
+load_job_config "${2:-}"
 # initialize_mitohpc expects these manifest variables to exist.
 IFS=$'\t' read -r SAMPLE ALIGNMENT OUTPUT_PREFIX < "$MANIFEST"
 initialize_mitohpc
