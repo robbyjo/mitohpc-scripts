@@ -225,6 +225,17 @@ not pass `qsub` options to `mito_pipeline.sh`.
 
 ## Output and recovery
 
+For a read-only support report on Biowulf, run:
+
+```bash
+bash diagnose_mitohpc.sh /path/to/mitohpc-scripts /path/to/output
+```
+
+The script creates a timestamped text report in the current directory. It does
+not submit or cancel jobs and does not print alignment contents or `config.env`.
+Review the report before forwarding it because it includes usernames,
+filesystem paths, hostnames, and job IDs.
+
 ```text
 OUTPUT/
   samples/SAMPLE/       MitoHPC per-sample output
