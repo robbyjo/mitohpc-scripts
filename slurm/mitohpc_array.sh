@@ -6,6 +6,46 @@ readonly HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=job_common.sh
 source "$HERE/job_common.sh"
 
+if [[ "${1:-}" == --index ]]; then
+    load_job_config "${2:-}"
+    task_id=${SLURM_ARRAY_TASK_ID:-}
+    [[ "$task_id" =~ ^[0-9]+$ ]] || job_die 'SLURM_ARRAY_TASK_ID is missing or invalid'
+    row=$(sed -n "$((task_id + 1))p" "$INDEX_MANIFEST")
+    [[ -n "$row" ]] || job_die "array index $task_id is outside the index manifest"
+    IFS=$'\t' read -r sample alignment index <<< "$row"
+    [[ -n "$sample" && -n "$alignment" && -n "$index" ]] || job_die "malformed index manifest row for task $task_id"
+    [[ -s "$alignment" ]] || job_die "alignment disappeared for $sample: $alignment"
+    [[ ! -L "$index" ]] || job_die "refusing to replace staged index symlink: $index"
+    command -v samtools >/dev/null 2>&1 || job_die 'samtools is required on compute nodes'
+
+    source_signature=$(stat -Lc '%s:%Y' "$alignment")
+    marker="$STATUS_DIR/index/$sample.source"
+    if [[ -s "$index" && -s "$marker" && "$(<"$marker")" == "$source_signature" ]]; then
+        printf 'Index for %s is current; skipping.\n' "$sample"
+        exit 0
+    fi
+
+    tmp_index="$index.tmp.${SLURM_JOB_ID:-$$}"
+    tmp_marker="$marker.tmp.${SLURM_JOB_ID:-$$}"
+    on_index_exit() {
+        local rc=$?
+        rm -f -- "$tmp_index" "$tmp_marker"
+        if ((rc != 0)); then
+            write_failure_status index "$sample" "$rc"
+        fi
+    }
+    trap on_index_exit EXIT
+    printf 'Creating index sample=%s input=%s\n' "$sample" "$alignment"
+    samtools index -@ "$CPUS" "$alignment" "$tmp_index"
+    [[ -s "$tmp_index" ]] || job_die "samtools did not create an index for $sample"
+    mv -f -- "$tmp_index" "$index"
+    printf '%s\n' "$source_signature" > "$tmp_marker"
+    mv -f -- "$tmp_marker" "$marker"
+    rm -f -- "$STATUS_DIR/index/$sample.failed"
+    printf 'Completed index sample=%s output=%s\n' "$sample" "$index"
+    exit 0
+fi
+
 load_job_config "${1:-}"
 load_manifest_row
 

@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## v0.1.1 — 2026-08-25
+
+- Automatically create missing BAM/CRAM indexes in a preliminary SLURM array.
+- Keep generated indexes in pipeline staging so input directories remain
+  untouched, and gate downstream jobs on successful indexing.
+- Add `--require-indexes` for the previous fail-fast behavior.
+
 ## v0.1.0 — 2026-08-25
 
 Initial public release:

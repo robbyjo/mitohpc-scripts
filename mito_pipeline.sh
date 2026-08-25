@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-readonly VERSION="0.1.0"
+readonly VERSION="0.1.1"
 
 die() {
     printf 'ERROR: %s\n' "$*" >&2
@@ -50,6 +50,7 @@ SLURM options:
   --prologue FILE           Shell file sourced in every compute job (e.g. module loads)
 
 Control options:
+  --require-indexes         Fail instead of scheduling creation of missing indexes
   --dry-run                 Validate and prepare a run, but do not call sbatch
   --version                 Print version
   -h, --help                Show this help
@@ -136,6 +137,7 @@ mail_user=''
 mail_type='FAIL'
 prologue=''
 dry_run=0
+create_indexes=1
 
 positional=()
 while (($#)); do
@@ -170,6 +172,7 @@ while (($#)); do
         --recursive) recursive=1; shift ;;
         --extract-mt) extract_mt=1; shift ;;
         --extract-only) extract_mt=1; extract_only=1; shift ;;
+        --require-indexes) create_indexes=0; shift ;;
         --dry-run) dry_run=1; shift ;;
         --version) printf '%s\n' "$VERSION"; exit 0 ;;
         -h|--help) usage; exit 0 ;;
@@ -245,12 +248,13 @@ samples_dir="$output_dir/samples"
 logs_dir="$output_dir/logs"
 extracted_dir="$output_dir/extracted"
 mkdir -p -- "$staging_dir" "$status_dir/mitohpc" "$status_dir/extract" "$runs_dir" "$samples_dir" "$logs_dir"
+mkdir -p -- "$status_dir/index"
 ((extract_mt)) && mkdir -p -- "$extracted_dir"
 
 if ((!dry_run)); then
     command -v squeue >/dev/null 2>&1 || die 'squeue is not available'
     while IFS= read -r previous_metadata; do
-        for job_key in mitohpc_array_job extract_array_job; do
+        for job_key in index_array_job mitohpc_array_job extract_array_job; do
             previous_job=$(awk -F '\t' -v key="$job_key" '$1 == key {print $2; exit}' "$previous_metadata")
             [[ "$previous_job" =~ ^[0-9]+$ ]] || continue
             previous_state=$(squeue -h -j "$previous_job" -o '%T' 2>/dev/null | head -n 1)
@@ -274,6 +278,8 @@ run_dir="$runs_dir/${run_stamp}-$$"
 mkdir -p -- "$run_dir/work"
 manifest="$run_dir/samples.tsv"
 : > "$manifest"
+index_manifest="$run_dir/indexes.tsv"
+: > "$index_manifest"
 declare -A seen_samples=()
 missing_indexes=()
 
@@ -287,15 +293,19 @@ for alignment in "${alignments[@]}"; do
     [[ -z "${seen_samples[$sample]:-}" ]] || die "duplicate sample name '$sample' (filenames must be unique)"
     seen_samples[$sample]=1
 
-    if ! index=$(find_index "$alignment"); then
-        missing_indexes+=("$alignment")
-        continue
-    fi
     extension=${alignment##*.}
     staged_alignment="$staging_dir/$sample.$extension"
     staged_index="$staged_alignment.$([[ "$extension" == bam ]] && printf bai || printf crai)"
     ensure_link "$alignment" "$staged_alignment"
-    ensure_link "$index" "$staged_index"
+    if index=$(find_index "$alignment"); then
+        ensure_link "$index" "$staged_index"
+    else
+        missing_indexes+=("$alignment")
+        if ((create_indexes)); then
+            [[ ! -L "$staged_index" ]] || die "refusing dangling staged index link: $staged_index"
+            printf '%s\t%s\t%s\n' "$sample" "$staged_alignment" "$staged_index" >> "$index_manifest"
+        fi
+    fi
     if idxstats=$(find_idxstats "$alignment"); then
         ensure_link "$idxstats" "$staging_dir/$sample.idxstats"
     fi
@@ -304,9 +314,12 @@ for alignment in "${alignments[@]}"; do
 done
 
 if ((${#missing_indexes[@]})); then
-    printf 'ERROR: missing BAM/CRAM indexes for:\n' >&2
-    printf '  %s\n' "${missing_indexes[@]}" >&2
-    die 'create the missing indexes and submit again'
+    if ((!create_indexes)); then
+        printf 'ERROR: missing BAM/CRAM indexes for:\n' >&2
+        printf '  %s\n' "${missing_indexes[@]}" >&2
+        die 'create the missing indexes or omit --require-indexes and submit again'
+    fi
+    log "will create ${#missing_indexes[@]} missing index(es) in $staging_dir"
 fi
 
 sample_count=$(wc -l < "$manifest")
@@ -327,6 +340,7 @@ config="$run_dir/config.env"
 {
     write_env RUN_DIR "$run_dir"
     write_env MANIFEST "$manifest"
+    write_env INDEX_MANIFEST "$index_manifest"
     write_env MITOHPC_SCRIPTS "$mitohpc_scripts"
     write_env INIT_SCRIPT "$init_script"
     write_env OUTPUT_DIR "$output_dir"
@@ -361,7 +375,7 @@ metadata="$run_dir/run.txt"
     fi
 } > "$metadata"
 
-log "validated $sample_count indexed sample(s)"
+log "validated $sample_count sample(s)"
 log "run record: $run_dir"
 if ((dry_run)); then
     log 'dry run complete; no jobs submitted'
@@ -378,11 +392,27 @@ if [[ -n "$mail_user" ]]; then
 fi
 
 array_range="0-$((sample_count - 1))%$max_parallel"
+index_job=''
 mitohpc_job=''
 extract_job=''
 summary_job=''
+if ((${#missing_indexes[@]})); then
+    index_range="0-$((${#missing_indexes[@]} - 1))%$max_parallel"
+    index_job=$(sbatch "${common_sbatch[@]}" \
+        --job-name=alignment_index \
+        --array="$index_range" \
+        --output="$logs_dir/index_%A_%a.out" \
+        --error="$logs_dir/index_%A_%a.err" \
+        "$SCRIPT_DIR/slurm/mitohpc_array.sh" --index "$config")
+    index_job=${index_job%%;*}
+    [[ "$index_job" =~ ^[0-9]+$ ]] || die "could not parse indexing job ID: $index_job"
+    printf 'index_array_job\t%s\n' "$index_job" >> "$metadata"
+    log "submitted alignment indexing array job $index_job"
+fi
 if ((!extract_only)); then
-    mitohpc_job=$(sbatch "${common_sbatch[@]}" \
+    mitohpc_dependency=()
+    [[ -z "$index_job" ]] || mitohpc_dependency+=(--dependency="afterok:$index_job")
+    mitohpc_job=$(sbatch "${common_sbatch[@]}" "${mitohpc_dependency[@]}" \
         --job-name=mitohpc \
         --array="$array_range" \
         --output="$logs_dir/mitohpc_%A_%a.out" \
@@ -396,7 +426,10 @@ fi
 
 if ((extract_mt)); then
     extract_dependency=()
-    ((extract_only)) || extract_dependency+=(--dependency="afterany:$mitohpc_job")
+    extract_dependencies=()
+    [[ -z "$index_job" ]] || extract_dependencies+=("afterok:$index_job")
+    ((extract_only)) || extract_dependencies+=("afterany:$mitohpc_job")
+    ((${#extract_dependencies[@]} == 0)) || extract_dependency+=(--dependency="$(IFS=,; printf '%s' "${extract_dependencies[*]}")")
     extract_job=$(sbatch "${common_sbatch[@]}" "${extract_dependency[@]}" \
         --job-name=extract_mt \
         --array="$array_range" \
@@ -436,6 +469,7 @@ if ((!extract_only)); then
 fi
 
 printf 'Submitted %s samples.' "$sample_count"
+[[ -z "$index_job" ]] || printf ' Indexing job: %s;' "$index_job"
 ((extract_only)) || printf ' MitoHPC job: %s; summary job: %s' "$mitohpc_job" "$summary_job"
 ((extract_mt)) && printf '; extraction job: %s' "$extract_job"
 printf '\nResults: %s\nLogs: %s\n' "$output_dir" "$logs_dir"

@@ -66,7 +66,7 @@ printf '%s\n' \
     'case "$1" in' \
     '  idxstats) printf "chr1\t1000\t100\t0\nchrM\t16569\t25\t0\n*\t0\t0\t0\n" ;;' \
     '  view) out=""; while (($#)); do if [[ "$1" == -o ]]; then out=$2; shift 2; else shift; fi; done; printf "cram\\n" > "$out" ;;' \
-    '  index) target=${@: -1}; printf "crai\\n" > "$target.crai" ;;' \
+    '  index) shift; while (($#)); do case "$1" in -@) shift 2;; *) break;; esac; done; input=$1; output=${2:-"$input.crai"}; printf "index\\n" > "$output" ;;' \
     '  *) exit 2 ;;' \
     'esac' \
     > "$TEST_DIR/bin/samtools"
@@ -114,6 +114,35 @@ assert_grep '--dependency=afterany:1001' "$TEST_DIR/sbatch.log"
 assert_grep '--dependency=afterok:1001,afterany:1002' "$TEST_DIR/sbatch.log"
 assert_grep 'MitoHPC job: 1001; summary job: 1003; extraction job: 1002' "$TEST_DIR/submit.stdout"
 
+# A missing source index is created in output staging by a preliminary array;
+# MitoHPC and summary jobs wait for that array to succeed.
+mkdir -p "$TEST_DIR/input-auto"
+printf 'bam-data\n' > "$TEST_DIR/input-auto/beta.bam"
+: > "$TEST_DIR/sbatch.log"
+PATH="$TEST_DIR/bin:$PATH" SBATCH_TEST_LOG="$TEST_DIR/sbatch.log" SBATCH_TEST_COUNTER="$TEST_DIR/sbatch.counter" \
+    "$ROOT/mito_pipeline.sh" "$TEST_DIR/input-auto" "$TEST_DIR/out-auto" \
+    --mitohpc-dir "$TEST_DIR/mitohpc" > "$TEST_DIR/auto.stdout"
+[[ $(wc -l < "$TEST_DIR/sbatch.log") -eq 3 ]] || fail 'expected indexing, MitoHPC, and summary submissions'
+assert_grep '--job-name=alignment_index' "$TEST_DIR/sbatch.log"
+assert_grep '--dependency=afterok:1004' "$TEST_DIR/sbatch.log"
+assert_grep 'Indexing job: 1004; MitoHPC job: 1005; summary job: 1006' "$TEST_DIR/auto.stdout"
+auto_run_dir=$(find "$TEST_DIR/out-auto/.mito-pipeline/runs" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+auto_config="$auto_run_dir/config.env"
+PATH="$TEST_DIR/bin:$PATH" SLURM_ARRAY_TASK_ID=0 SLURM_JOB_ID=2000 \
+    "$ROOT/slurm/mitohpc_array.sh" --index "$auto_config"
+assert_file "$TEST_DIR/out-auto/.mito-pipeline/alignments/beta.bam.bai"
+PATH="$TEST_DIR/bin:$PATH" SLURM_ARRAY_TASK_ID=0 SLURM_JOB_ID=2001 \
+    "$ROOT/slurm/mitohpc_array.sh" "$auto_config"
+assert_file "$TEST_DIR/out-auto/samples/beta/beta.filter-called"
+
+# Opting out retains strict validation.
+if PATH="$TEST_DIR/bin:$PATH" "$ROOT/mito_pipeline.sh" "$TEST_DIR/input-auto" "$TEST_DIR/out-require" \
+    --mitohpc-dir "$TEST_DIR/mitohpc" --require-indexes --dry-run \
+    > "$TEST_DIR/require.stdout" 2> "$TEST_DIR/require.stderr"; then
+    fail '--require-indexes accepted a missing index'
+fi
+assert_grep 'create the missing indexes or omit --require-indexes' "$TEST_DIR/require.stderr"
+
 # Extraction-only submission creates one unblocked array and no summary.
 : > "$TEST_DIR/sbatch.log"
 PATH="$TEST_DIR/bin:$PATH" SBATCH_TEST_LOG="$TEST_DIR/sbatch.log" SBATCH_TEST_COUNTER="$TEST_DIR/sbatch.counter" \
@@ -121,7 +150,7 @@ PATH="$TEST_DIR/bin:$PATH" SBATCH_TEST_LOG="$TEST_DIR/sbatch.log" SBATCH_TEST_CO
     --mitohpc-dir "$TEST_DIR/mitohpc" --extract-only --reference-fasta "$TEST_DIR/mitohpc/RefSeq/hs38DH.fa" \
     > "$TEST_DIR/extract-only.stdout"
 [[ $(wc -l < "$TEST_DIR/sbatch.log") -eq 1 ]] || fail 'extraction-only mode should submit one array'
-assert_grep 'extraction job: 1004' "$TEST_DIR/extract-only.stdout"
+assert_grep 'extraction job: 1007' "$TEST_DIR/extract-only.stdout"
 
 run_dir=$(find "$TEST_DIR/out/.mito-pipeline/runs" -mindepth 1 -maxdepth 1 -type d | head -n 1)
 config="$run_dir/config.env"

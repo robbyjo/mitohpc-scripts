@@ -30,10 +30,13 @@ exists before submission.
 ./mito_pipeline.sh /path/to/bams_or_crams /path/to/results
 ```
 
-The input directory may contain BAMs, CRAMs, or both. Every alignment must be
-coordinate sorted and have an index. Both common index naming conventions are
-accepted (`sample.bai` and `sample.bam.bai`, likewise for CRAM), even though
-MitoHPC itself only accepts the latter.
+The input directory may contain BAMs, CRAMs, or both. Alignments must be
+coordinate sorted. Existing indexes in either common naming convention are
+accepted (`sample.bai` and `sample.bam.bai`, likewise for CRAM). When an index
+is missing, the launcher schedules a SLURM indexing array first and stores the
+generated index under `OUTPUT/.mito-pipeline/alignments`; the source directory
+is not modified. Analysis starts only after every new index succeeds. Use
+`--require-indexes` to restore fail-fast validation without automatic indexing.
 
 Useful examples:
 
@@ -103,6 +106,8 @@ the selected MitoHPC profile.
 
 - One SLURM array task per sample. A failed sample does not cancel successful
   samples.
+- When needed, one preliminary SLURM array task per missing BAM/CRAM index.
+  Downstream work waits for the entire indexing array to succeed.
 - With `--extract-mt`, a separate extraction array that starts after the
   MitoHPC array finishes, whether or not every analysis task succeeded.
 - One summary job that runs only after the MitoHPC array succeeds and, when
@@ -204,9 +209,10 @@ while an earlier MitoHPC array for that output directory is still active.
 
 ## Deliberate safety checks
 
-The launcher fails before submission when it finds missing indexes, duplicate or
-unsafe sample names, no alignments, an invalid resource request, or an incomplete
-MitoHPC installation. Output and MitoHPC installation paths containing
+The launcher automatically schedules missing indexes unless `--require-indexes`
+is used. It fails before submission for duplicate or unsafe sample names, no
+alignments, an invalid resource request, or an incomplete MitoHPC installation.
+Output and MitoHPC installation paths containing
 whitespace are rejected because the pinned MitoHPC internals do not quote paths
 consistently. Input paths are normalized through safe staging links.
 
