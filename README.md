@@ -1,10 +1,10 @@
-# Turn-key MitoHPC on SLURM
+# Turn-key MitoHPC on SLURM and Open Grid Scheduler
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
-This directory wraps MitoHPC in a fault-isolated, resumable SLURM workflow. The
-only required run arguments are an input alignment directory and an output
-directory.
+This directory wraps MitoHPC in a fault-isolated, resumable workflow for SLURM
+and Open Grid Scheduler/Grid Engine. The only required run arguments are an
+input alignment directory and an output directory.
 
 ## 1. One-time installation
 
@@ -22,10 +22,10 @@ jobs. A different compatible checkout can be selected at run time with
 `--mitohpc-dir`.
 
 Keep the complete repository on a filesystem visible from both the login and
-compute nodes, and do not move it while jobs are active. SLURM copies each batch
-entry script into a temporary spool directory without its sibling files; the
-launcher therefore passes the original absolute `slurm/` directory to every
-job explicitly.
+compute nodes, and do not move it while jobs are active. Schedulers may copy
+each batch entry script into a temporary spool directory without its sibling
+files; the launchers therefore pass the original absolute shared-worker
+directory to every job explicitly.
 
 The default analysis profile is MitoHPC's `init.sh` (hs38DH in the pinned
 release). Select another installed profile such as `init.mm39.sh` with
@@ -34,16 +34,33 @@ exists before submission.
 
 ## 2. Submit a cohort
 
+Use the scheduler-specific entry point:
+
 ```bash
+# SLURM
 ./mito_pipeline.sh /path/to/bams_or_crams /path/to/results
+
+# Any qsub installation: identifies the dialect and currently accepts OGS/GE
+./mito_pipeline_qsub.sh /path/to/bams_or_crams /path/to/results
+
+# Detect SLURM versus qsub automatically
+./mito_pipeline_auto.sh /path/to/bams_or_crams /path/to/results
+```
+
+If both scheduler clients are installed, select one explicitly:
+
+```bash
+./mito_pipeline_auto.sh --scheduler slurm INPUT OUTPUT
+./mito_pipeline_auto.sh --scheduler qsub INPUT OUTPUT
 ```
 
 The input directory may contain BAMs, CRAMs, or both. Alignments must be
 coordinate sorted. Existing indexes in either common naming convention are
 accepted (`sample.bai` and `sample.bam.bai`, likewise for CRAM). When an index
-is missing, the launcher schedules a SLURM indexing array first and stores the
-generated index under `OUTPUT/.mito-pipeline/alignments`; the source directory
-is not modified. Analysis starts only after every new index succeeds. Use
+is missing, the selected launcher schedules an indexing array first and stores
+the generated index under `OUTPUT/.mito-pipeline/alignments`; the source
+directory is not modified. Analysis starts only after every new index succeeds.
+Use
 `--require-indexes` to restore fail-fast validation without automatic indexing.
 
 Useful examples:
@@ -72,9 +89,10 @@ Useful examples:
 ./mito_pipeline.sh /data/wgs /results/copy_number --iterations 0
 ```
 
-Use `./mito_pipeline.sh --help` for all resource and analysis options. If your
-cluster needs modules or other site initialization, put those commands in a
-small shell file and pass `--prologue /path/to/cluster_env.sh`.
+Use the selected launcher's `--help` output for all resource and analysis
+options. If your cluster needs modules or other site initialization, put those
+commands in a small shell file and pass
+`--prologue /path/to/cluster_env.sh`.
 
 Compute jobs automatically prefer tools installed in MitoHPC's `bin/`
 directory, including bundled `samtools` and `bedtools`. A cluster module or
@@ -89,7 +107,7 @@ run analysis and extraction together. Use `--iterations 0 --extract-mt` for
 copy number plus extraction without variant calling, or `--extract-only` when no
 MitoHPC analysis or cohort summary is wanted.
 
-Extraction runs as a separate SLURM array from the original whole-genome
+Extraction runs as a separate scheduler array from the original whole-genome
 BAM/CRAM files. It produces one coordinate-preserving CRAM and index per sample:
 
 ```text
@@ -117,8 +135,8 @@ the selected MitoHPC profile.
 
 ## What gets submitted
 
-- Normally, one SLURM array task processes one sample. If the planned workflow
-  would exceed the association's submit-job quota, the launcher automatically
+- Normally, one scheduler array task processes one sample. If the planned
+  workflow would exceed the association's submit-job quota, the launcher automatically
   bundles several samples sequentially in each task. Failures are recorded per
   sample, successful samples remain resumable, and the bundled task reports a
   failure after attempting every assigned sample.
@@ -129,12 +147,13 @@ the selected MitoHPC profile.
 - One summary job runs only after every MitoHPC array succeeds and, when
   extraction was requested, after extraction finishes.
 
-Every task explicitly requests one node. The default task request is 4 CPUs,
-16 GB, and 2 days, with at most 20 tasks running simultaneously and at most
-1,000 tasks in each array. Change these with `--cpus`, `--memory`, `--time`,
-`--max-parallel`, and `--max-array-size`. When bundling is active, `--time`
-covers all samples processed sequentially by that task, so select an appropriate
-partition and wall time.
+Every SLURM task explicitly requests one node. Grid Engine tasks request one
+parallel-environment allocation. The default task request is 4 CPUs/slots,
+16 GB total memory, and 2 days, with at most 20 tasks running simultaneously
+and at most 1,000 tasks in each array. Change these with `--cpus`, `--memory`,
+`--time`, `--max-parallel`, and `--max-array-size`. When bundling is active,
+`--time` covers all samples processed sequentially by that task, so select an
+appropriate queue/partition and wall time.
 
 MitoHPC's Java heap and per-sort-thread memory are capped separately at 3 GB by
 default (`--tool-memory`), preventing four sort threads from each treating the
@@ -146,11 +165,12 @@ Schedulers limit jobs or array tasks, not physical “servers.” There are thre
 separate limits:
 
 1. **Concurrent-task limit:** how many array tasks may run at once. Controlled
-   by `--max-parallel` and SLURM's `%N` syntax.
+   by `--max-parallel`, SLURM's `%N`, or Grid Engine's `-tc N`.
 2. **Array-size limit:** how many tasks one array specification may contain.
    Controlled by `--max-array-size`.
-3. **Submit-job limit:** how many running plus pending jobs the association may
-   have. Controlled here by `--max-user-jobs` and `--job-headroom`.
+3. **Submit-job limit:** how many running plus pending tasks the user or
+   association may have. Controlled here by `--max-user-jobs` and
+   `--job-headroom`.
 
 ### SLURM (`sbatch`)
 
@@ -222,17 +242,83 @@ If your cluster reports a different `MaxArraySize`, pass it with
 scontrol show config | grep -i MaxArraySize
 ```
 
-### Grid Engine-style `qsub`
+### Open Grid Scheduler / Grid Engine (`qsub`)
 
-This workflow submits only with SLURM `sbatch`. In a separate Grid Engine
-workflow, comparable array concurrency control is commonly
-`qsub -t 1-N -tc 20`. Other schedulers also use a command named `qsub`, notably
-PBS, and their syntax can differ. Check the scheduler's site documentation; do
-not pass `qsub` options to `mito_pipeline.sh`.
+`mito_pipeline_qsub.sh` identifies the qsub dialect from `qstat --version`.
+Open Grid Scheduler/GE output such as `OGS/GE 2011.11p1` is routed to the OGS
+backend. PBS Pro, OpenPBS, and Torque are deliberately rejected because they use
+different array, dependency, and resource syntax.
+
+A typical OGS invocation is:
+
+```bash
+./mito_pipeline_qsub.sh INPUT OUTPUT --iterations 0 --extract-mt \
+  --queue all.q --parallel-env smp \
+  --memory-resource h_vmem --time-resource h_rt \
+  --max-parallel 20 --max-array-size 1000 \
+  --max-user-jobs 1000 --job-headroom 20
+```
+
+The defaults are `smp`, `h_vmem`, and `h_rt`. Before a real submission, the
+launcher uses `qconf -spl` and `qconf -sc` when available and stops early if
+those names do not exist. Obtain the site's valid values with:
+
+```bash
+qconf -spl
+qconf -sc
+qconf -sql
+```
+
+Override `--parallel-env`, `--memory-resource`, `--time-resource`, and
+`--queue` as required by the site. Add other complex requests without shell
+evaluation by repeating `--qsub-resource SPEC`, for example:
+
+```bash
+./mito_pipeline_qsub.sh INPUT OUTPUT \
+  --parallel-env threaded \
+  --memory-resource mem_free \
+  --qsub-resource 'exclusive=true'
+```
+
+OGS memory complexes such as `h_vmem` are normally requested per slot. The
+launcher treats `--memory` as total task memory and divides it across
+`--cpus` slots, rounding up to MiB. Thus `--cpus 4 --memory 16G` submits
+`-pe smp 4 -l h_vmem=4096M`. Wall times such as `2-00:00:00` are converted
+to OGS form (`48:00:00`).
+
+Grid Engine arrays are one-based, so a 1,000-task submission uses:
+
+```text
+qsub -t 1-1000 -tc 20
+```
+
+The compute entry wrapper converts `SGE_TASK_ID` to the workflow's internal
+zero-based manifest coordinate. It also maps `JOB_ID` into scheduler-neutral
+status records and writes predictable `.out`/`.err` files under
+`OUTPUT/logs`.
+
+The launcher queries `qstat -u "$USER" -g d` so array tasks are expanded when
+calculating available submit slots. As with SLURM, `--max-user-jobs` must match
+the site's policy; OGS does not provide Biowulf's `batchlim` helper.
+
+OGS `-hold_jid` waits for prior jobs to finish but does not provide SLURM's
+`afterok` failure propagation. Each downstream worker therefore validates its
+required inputs, and the summary job independently verifies a current success
+marker for every sample before building cohort summaries.
+
+Use the full detector when the same repository may run at several institutions:
+
+```bash
+./mito_pipeline_auto.sh INPUT OUTPUT
+./mito_pipeline_auto.sh --scheduler qsub INPUT OUTPUT
+```
+
+Automatic mode prefers SLURM when both client sets are visible. The explicit
+override is useful on login nodes exposing more than one scheduler.
 
 ## Output and recovery
 
-For a read-only support report on Biowulf, run:
+For a read-only support report on either scheduler, run:
 
 ```bash
 bash diagnose_mitohpc.sh /path/to/mitohpc-scripts /path/to/output

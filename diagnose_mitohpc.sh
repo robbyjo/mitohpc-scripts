@@ -12,7 +12,7 @@ Examples:
   bash diagnose_mitohpc.sh /data/$USER/mitohpc-scripts /data/$USER/mito-results
 
 This script is read-only except for creating REPORT_FILE. It does not submit,
-cancel, or modify SLURM jobs, pipeline output, input alignments, or indexes.
+cancel, or modify scheduler jobs, pipeline output, input alignments, or indexes.
 EOF
 }
 
@@ -87,7 +87,13 @@ printf 'output_directory=%s\n' "${output_dir:-not supplied}"
 section 'Pipeline files'
 for file in \
     mito_pipeline.sh \
+    mito_pipeline_core.sh \
+    mito_pipeline_auto.sh \
+    mito_pipeline_qsub.sh \
+    mito_pipeline_ogs.sh \
     setup_mitohpc.sh \
+    ogs/bundle_array.sh \
+    ogs/summary.sh \
     slurm/bundle_array.sh \
     slurm/job_common.sh \
     slurm/mitohpc_array.sh \
@@ -104,7 +110,7 @@ done
 
 section 'Pipeline syntax'
 syntax_files=()
-for path in "$pipeline_dir/mito_pipeline.sh" "$pipeline_dir"/slurm/*.sh; do
+for path in "$pipeline_dir"/mito_pipeline*.sh "$pipeline_dir"/ogs/*.sh "$pipeline_dir"/slurm/*.sh; do
     [[ -f "$path" ]] && syntax_files+=("$path")
 done
 if ((${#syntax_files[@]})); then
@@ -118,17 +124,17 @@ else
 fi
 
 section 'Required fix markers'
-if grep -q -- '--max-user-jobs' "$pipeline_dir/mito_pipeline.sh" 2>/dev/null; then
+if grep -q -- '--max-user-jobs' "$pipeline_dir/mito_pipeline_core.sh" 2>/dev/null; then
     printf 'PASS: quota-aware launcher option is present\n'
 else
     printf 'FAIL: quota-aware launcher option is absent (old launcher)\n'
 fi
-if grep -q -- 'bundle_array.sh.*SCRIPT_DIR/slurm' "$pipeline_dir/mito_pipeline.sh" 2>/dev/null; then
+if grep -q -- 'bundle_array.sh.*SCRIPT_DIR/slurm' "$pipeline_dir/mito_pipeline_core.sh" 2>/dev/null; then
     printf 'PASS: launcher passes the shared slurm directory to bundle jobs\n'
 else
     printf 'FAIL: shared slurm directory argument is absent (spool-path bug likely)\n'
 fi
-if grep -q -- 'summary.sh.*SCRIPT_DIR/slurm' "$pipeline_dir/mito_pipeline.sh" 2>/dev/null; then
+if grep -q -- 'summary.sh.*SCRIPT_DIR/slurm' "$pipeline_dir/mito_pipeline_core.sh" 2>/dev/null; then
     printf 'PASS: launcher passes the shared slurm directory to summary jobs\n'
 else
     printf 'FAIL: summary shared-directory argument is absent\n'
@@ -148,8 +154,8 @@ else
     printf 'Pipeline directory is not a Git working tree, or git is unavailable.\n'
 fi
 
-section 'SLURM commands and limits'
-for command_name in sbatch squeue sacct batchlim jobhist samtools; do
+section 'Scheduler commands and limits'
+for command_name in sbatch squeue sacct batchlim jobhist qsub qstat qconf qacct samtools; do
     if command -v "$command_name" >/dev/null 2>&1; then
         printf '%s=%s\n' "$command_name" "$(command -v "$command_name")"
     else
@@ -158,6 +164,8 @@ for command_name in sbatch squeue sacct batchlim jobhist samtools; do
 done
 command -v sbatch >/dev/null 2>&1 && show_command sbatch --version
 command -v batchlim >/dev/null 2>&1 && show_command batchlim
+command -v qstat >/dev/null 2>&1 && show_command qstat --version
+command -v qconf >/dev/null 2>&1 && show_command qconf -spl
 bundled_samtools="$pipeline_dir/software/MitoHPC/bin/samtools"
 if [[ -x "$bundled_samtools" ]]; then
     printf 'bundled_samtools=%s\n' "$bundled_samtools"
@@ -176,8 +184,10 @@ fi
 section 'Currently pending or running jobs'
 if command -v squeue >/dev/null 2>&1; then
     show_command squeue -r -u "${USER:-$(id -un)}" -o '%.24i %.18j %.10P %.10T %.30R %.12M %.12l'
+elif command -v qstat >/dev/null 2>&1; then
+    show_command qstat -u "${USER:-$(id -un)}" -g d
 else
-    printf 'squeue is unavailable.\n'
+    printf 'Neither squeue nor qstat is available.\n'
 fi
 
 section 'Recent accounting records (last 100 lines since today)'
@@ -223,6 +233,18 @@ if [[ -n "$output_dir" ]]; then
                         ;;
                 esac
             done < "$latest_run/run.txt"
+        elif command -v qacct >/dev/null 2>&1; then
+            while IFS=$'\t' read -r key job_id; do
+                case "$key" in
+                    index_array_job|mitohpc_array_job|extract_array_job|summary_job)
+                        [[ "$job_id" =~ ^[0-9]+$ ]] || continue
+                        printf '\n--- %s %s ---\n' "$key" "$job_id"
+                        qacct -j "$job_id" 2>&1 | head -n 80
+                        ;;
+                esac
+            done < "$latest_run/run.txt"
+        else
+            printf 'Neither sacct nor qacct is available for historical job details.\n'
         fi
 
         input_dir=$(awk -F '\t' '$1 == "input_dir" {print $2; exit}' "$latest_run/run.txt")
@@ -263,8 +285,8 @@ if [[ -n "$output_dir" && -n "$latest_run" && -r "$latest_run/run.txt" ]] && \
     ! grep -q $'^bundle_size\t' "$latest_run/run.txt"; then
     printf 'DETECTED: latest recorded run used the old launcher; do not resubmit it\n'
 fi
-if ! grep -q -- 'bundle_array.sh.*SCRIPT_DIR/slurm' "$pipeline_dir/mito_pipeline.sh" 2>/dev/null; then
-    printf 'ACTION: replace the complete pipeline directory with Git commit 4e39d92 or newer\n'
+if ! grep -q -- 'bundle_array.sh.*SCRIPT_DIR/slurm' "$pipeline_dir/mito_pipeline_core.sh" 2>/dev/null; then
+    printf 'ACTION: replace the complete pipeline directory with the latest release\n'
 else
     printf 'PASS: installed launcher contains the shared-directory spool fix\n'
 fi

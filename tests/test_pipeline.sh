@@ -102,6 +102,36 @@ printf '%s\n' \
     'for argument in "$@"; do [[ "$argument" != -j ]] || exit 88; done' \
     'for ((i = 0; i < ${SQUEUE_TEST_ACTIVE:-0}; i++)); do printf "%s|RUNNING\n" "$((9000 + i))"; done' \
     > "$TEST_DIR/bin/squeue"
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -Eeuo pipefail' \
+    'log=${QSUB_TEST_LOG:?}' \
+    'printf "%s\n" "$*" >> "$log"' \
+    'counter=${QSUB_TEST_COUNTER:?}' \
+    'n=$(<"$counter")' \
+    'n=$((n + 1))' \
+    'printf "%s\n" "$n" > "$counter"' \
+    'range=""' \
+    'while (($#)); do if [[ "$1" == -t ]]; then range=$2; break; fi; shift; done' \
+    'if [[ -n "$range" ]]; then printf "%s.%s:1\n" "$n" "$range"; else printf "%s\n" "$n"; fi' \
+    > "$TEST_DIR/bin/qsub"
+
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ "${1:-}" == --version ]]; then printf "%s\n" "${QSTAT_TEST_VERSION:-OGS/GE 2011.11p1}"; exit 1; fi' \
+    'printf "job-ID prior name user state submit/start at queue slots ja-task-ID\n"' \
+    'printf "--------------------------------------------------------------------------------\n"' \
+    'for ((i = 0; i < ${QSTAT_TEST_ACTIVE:-0}; i++)); do printf "%s 0.5 mock %s qw now 1 %s\n" "$((9100 + i))" "${USER:-tester}" "$((i + 1))"; done' \
+    > "$TEST_DIR/bin/qstat"
+
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'case "${1:-}" in' \
+    '  -spl) printf "smp\nserial\n" ;;' \
+    '  -sc) printf "h_vmem h_vmem MEMORY <= YES JOB 0 0\nh_rt h_rt TIME <= YES JOB 0 0\n" ;;' \
+    '  *) exit 2 ;;' \
+    'esac' \
+    > "$TEST_DIR/bin/qconf"
 
 chmod +x "$TEST_DIR/mitohpc/scripts/"* "$TEST_DIR/mitohpc/bin/"* "$TEST_DIR/bin/"*
 
@@ -221,6 +251,12 @@ chmod +x "$TEST_DIR/spool/slurm_script" "$TEST_DIR/spool/summary_script"
 PATH="$TEST_DIR/bin:$PATH" SLURM_ARRAY_TASK_ID=0 SLURM_JOB_ID=2012 \
     "$TEST_DIR/spool/slurm_script" "$ROOT/slurm" mitohpc "$quota_config" 0 1 6
 assert_file "$TEST_DIR/out-quota/samples/quota0/quota0.filter-called"
+# Complete the remaining mocked bundle so the summary's scheduler-independent
+# completeness guard sees a scientifically valid cohort.
+PATH="$TEST_DIR/bin:$PATH" SLURM_ARRAY_TASK_ID=0 SLURM_JOB_ID=2012 \
+    "$TEST_DIR/spool/slurm_script" "$ROOT/slurm" mitohpc "$quota_config" 1 2 6
+assert_file "$TEST_DIR/out-quota/samples/quota1/quota1.filter-called"
+assert_file "$TEST_DIR/out-quota/samples/quota2/quota2.filter-called"
 PATH="$TEST_DIR/bin:$PATH" SLURM_JOB_ID=2013 \
     "$TEST_DIR/spool/summary_script" "$ROOT/slurm" "$quota_config"
 assert_file "$TEST_DIR/out-quota/summary-called"
@@ -286,5 +322,95 @@ PATH="$TEST_DIR/bin:$PATH" SBATCH_TEST_LOG="$TEST_DIR/sbatch.log" SBATCH_TEST_CO
     --mitohpc-dir "$TEST_DIR/mitohpc" > "$TEST_DIR/stale-job.stdout"
 [[ $(wc -l < "$TEST_DIR/sbatch.log") -eq 2 ]] || fail 'stale historical job ID prevented resubmission'
 assert_grep 'Submitted 1 samples.' "$TEST_DIR/stale-job.stdout"
+
+# Open Grid Scheduler 2011.11 submission: qsub uses one-based arrays, -tc
+# throttling, -hold_jid dependencies, per-slot memory, and normalized job IDs.
+printf '5000\n' > "$TEST_DIR/qsub.counter"
+: > "$TEST_DIR/qsub.log"
+PATH="$TEST_DIR/bin:$PATH" QSUB_TEST_LOG="$TEST_DIR/qsub.log" QSUB_TEST_COUNTER="$TEST_DIR/qsub.counter" \
+    QSTAT_TEST_ACTIVE=2 "$ROOT/mito_pipeline_qsub.sh" "$TEST_DIR/input" "$TEST_DIR/out-ogs" \
+    --mitohpc-dir "$TEST_DIR/mitohpc" --extract-mt \
+    --reference-fasta "$TEST_DIR/mitohpc/RefSeq/hs38DH.fa" \
+    --queue all.q --project mito --parallel-env smp \
+    --memory-resource h_vmem --time-resource h_rt --qsub-resource exclusive=true \
+    --max-user-jobs 100 --job-headroom 5 > "$TEST_DIR/ogs-submit.stdout"
+
+[[ $(wc -l < "$TEST_DIR/qsub.log") -eq 3 ]] || fail 'expected three qsub calls'
+assert_grep '-pe smp 4' "$TEST_DIR/qsub.log"
+assert_grep '-l h_vmem=4096M' "$TEST_DIR/qsub.log"
+assert_grep '-l h_rt=48:00:00' "$TEST_DIR/qsub.log"
+assert_grep '-q all.q' "$TEST_DIR/qsub.log"
+assert_grep '-P mito' "$TEST_DIR/qsub.log"
+assert_grep '-l exclusive=true' "$TEST_DIR/qsub.log"
+assert_grep '-t 1-1 -tc 1' "$TEST_DIR/qsub.log"
+assert_grep '-hold_jid 5001' "$TEST_DIR/qsub.log"
+assert_grep '-hold_jid 5001,5002' "$TEST_DIR/qsub.log"
+assert_grep 'MitoHPC jobs: 5001; summary job: 5003; extraction jobs: 5002' "$TEST_DIR/ogs-submit.stdout"
+
+# Grid Engine chunk chaining and missing-index dependencies use completion
+# holds, while workers and the summary enforce scientific success explicitly.
+mkdir -p "$TEST_DIR/input-ogs-chunk"
+for sample_number in 0 1 2; do
+    printf 'bam-data\n' > "$TEST_DIR/input-ogs-chunk/chunk${sample_number}.bam"
+    printf 'index-data\n' > "$TEST_DIR/input-ogs-chunk/chunk${sample_number}.bam.bai"
+done
+: > "$TEST_DIR/qsub.log"
+PATH="$TEST_DIR/bin:$PATH" QSUB_TEST_LOG="$TEST_DIR/qsub.log" QSUB_TEST_COUNTER="$TEST_DIR/qsub.counter" \
+    "$ROOT/mito_pipeline_qsub.sh" "$TEST_DIR/input-ogs-chunk" "$TEST_DIR/out-ogs-chunk" \
+    --mitohpc-dir "$TEST_DIR/mitohpc" --max-array-size 2 \
+    --max-user-jobs 100 --job-headroom 5 > "$TEST_DIR/ogs-chunk.stdout"
+[[ $(wc -l < "$TEST_DIR/qsub.log") -eq 3 ]] || fail 'expected two chunked qsub arrays and one summary'
+assert_grep '-t 1-2 -tc 2' "$TEST_DIR/qsub.log"
+assert_grep '-t 1-1 -tc 1 -o' "$TEST_DIR/qsub.log"
+assert_grep '-hold_jid 5004' "$TEST_DIR/qsub.log"
+assert_grep '-hold_jid 5004,5005' "$TEST_DIR/qsub.log"
+
+mkdir -p "$TEST_DIR/input-ogs-index"
+printf 'bam-data\n' > "$TEST_DIR/input-ogs-index/indexme.bam"
+: > "$TEST_DIR/qsub.log"
+PATH="$TEST_DIR/bin:$PATH" QSUB_TEST_LOG="$TEST_DIR/qsub.log" QSUB_TEST_COUNTER="$TEST_DIR/qsub.counter" \
+    "$ROOT/mito_pipeline_qsub.sh" "$TEST_DIR/input-ogs-index" "$TEST_DIR/out-ogs-index" \
+    --mitohpc-dir "$TEST_DIR/mitohpc" --max-user-jobs 100 --job-headroom 5 \
+    > "$TEST_DIR/ogs-index.stdout"
+[[ $(wc -l < "$TEST_DIR/qsub.log") -eq 3 ]] || fail 'expected Grid Engine index, analysis, and summary submissions'
+assert_grep '-N alignment_index -t 1-1 -tc 1' "$TEST_DIR/qsub.log"
+assert_grep '-hold_jid 5007' "$TEST_DIR/qsub.log"
+assert_grep '-hold_jid 5008' "$TEST_DIR/qsub.log"
+ogs_run_dir=$(find "$TEST_DIR/out-ogs/.mito-pipeline/runs" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+ogs_config="$ogs_run_dir/config.env"
+assert_grep $'scheduler\togs' "$ogs_run_dir/run.txt"
+assert_grep $'active_jobs_at_submit\t2' "$ogs_run_dir/run.txt"
+
+# The Grid Engine entry wrapper converts SGE's one-based task ID to the
+# zero-based worker coordinate used by the shared manifest implementation.
+PATH="$TEST_DIR/bin:$PATH" SGE_TASK_ID=1 JOB_ID=6001 \
+    bash "$ROOT/ogs/bundle_array.sh" "$ROOT/slurm" mitohpc "$ogs_config" 0 1 1 \
+    "$TEST_DIR/out-ogs/logs" mitohpc
+PATH="$TEST_DIR/bin:$PATH" SGE_TASK_ID=1 JOB_ID=6002 \
+    bash "$ROOT/ogs/bundle_array.sh" "$ROOT/slurm" extract "$ogs_config" 0 1 1 \
+    "$TEST_DIR/out-ogs/logs" extract
+PATH="$TEST_DIR/bin:$PATH" JOB_ID=6003 \
+    bash "$ROOT/ogs/summary.sh" "$ROOT/slurm" "$ogs_config" "$TEST_DIR/out-ogs/logs" summary
+assert_file "$TEST_DIR/out-ogs/samples/alpha/alpha.filter-called"
+assert_file "$TEST_DIR/out-ogs/extracted/alpha.cram"
+assert_file "$TEST_DIR/out-ogs/summary-called"
+assert_file "$TEST_DIR/out-ogs/logs/mitohpc_6001_0.out"
+assert_file "$TEST_DIR/out-ogs/logs/mitohpc_6001_0.err"
+assert_grep $'job_id\t6001' "$TEST_DIR/out-ogs/.mito-pipeline/status/mitohpc/alpha.ok"
+assert_grep $'array_task_id\t0' "$TEST_DIR/out-ogs/.mito-pipeline/status/mitohpc/alpha.ok"
+
+# The top-level detector can be overridden on hosts exposing both scheduler
+# clients, and the qsub detector refuses PBS instead of using Grid Engine flags.
+PATH="$TEST_DIR/bin:$PATH" QSUB_TEST_LOG="$TEST_DIR/qsub.log" QSUB_TEST_COUNTER="$TEST_DIR/qsub.counter" \
+    "$ROOT/mito_pipeline_auto.sh" --scheduler qsub "$TEST_DIR/input" "$TEST_DIR/out-auto-ogs" \
+    --mitohpc-dir "$TEST_DIR/mitohpc" --dry-run > "$TEST_DIR/auto-ogs.stdout"
+auto_ogs_run=$(find "$TEST_DIR/out-auto-ogs/.mito-pipeline/runs" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+assert_grep $'scheduler\togs' "$auto_ogs_run/run.txt"
+if PATH="$TEST_DIR/bin:$PATH" QSTAT_TEST_VERSION='PBSPro_2024' \
+    "$ROOT/mito_pipeline_qsub.sh" "$TEST_DIR/input" "$TEST_DIR/out-pbs" \
+    --mitohpc-dir "$TEST_DIR/mitohpc" > "$TEST_DIR/pbs.stdout" 2> "$TEST_DIR/pbs.stderr"; then
+    fail 'PBS qsub was incorrectly accepted as Grid Engine'
+fi
+assert_grep 'detected a PBS/Torque qsub implementation' "$TEST_DIR/pbs.stderr"
 
 printf 'PASS: pipeline integration tests\n'

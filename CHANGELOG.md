@@ -4,6 +4,19 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+## v0.2.1 — 2026-08-26
+
+- Add Open Grid Scheduler/Grid Engine 2011.11 support with one-based qsub
+  arrays, `-tc` throttling, `-hold_jid` dependencies, queue/project/resources,
+  per-slot memory conversion, active-task quota preflight, and predictable logs.
+- Add qsub-dialect and scheduler auto-detection entry points while preserving
+  the existing `mito_pipeline.sh` SLURM interface; reject PBS/Torque safely
+  instead of submitting incompatible Grid Engine flags.
+- Share discovery, validation, resumability, bundling, and scientific execution
+  across scheduler backends, with integration coverage for both SLURM and OGS.
+- Verify every current per-sample MitoHPC success marker before cohort summary
+  generation, compensating for Grid Engine's completion-only `-hold_jid`.
+
 ## v0.2.0 — 2026-08-26
 
 - Split cohorts into sequential SLURM arrays with `--max-array-size`, avoiding
