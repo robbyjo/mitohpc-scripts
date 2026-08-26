@@ -269,11 +269,22 @@ mkdir -p -- "$status_dir/index"
 
 if ((!dry_run)); then
     command -v squeue >/dev/null 2>&1 || die 'squeue is not available'
+    queue_user=${USER:-}
+    [[ -n "$queue_user" ]] || queue_user=$(id -un)
+    if ! queue_snapshot=$(squeue -h -r -u "$queue_user" -o '%A|%T' 2>&1); then
+        die "could not query active SLURM jobs: $queue_snapshot"
+    fi
     while IFS= read -r previous_metadata; do
         for job_key in index_array_job mitohpc_array_job extract_array_job; do
             while IFS= read -r previous_job; do
                 [[ "$previous_job" =~ ^[0-9]+$ ]] || continue
-                previous_state=$(squeue -h -j "$previous_job" -o '%T' 2>/dev/null | head -n 1)
+                previous_state=$(awk -F '|' -v job="$previous_job" '
+                    {
+                        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1)
+                        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2)
+                    }
+                    $1 == job {print $2; exit}
+                ' <<< "$queue_snapshot")
                 [[ -z "$previous_state" ]] || \
                     die "job $previous_job is still $previous_state for this output directory; wait before resubmitting"
             done < <(awk -F '\t' -v key="$job_key" '$1 == key {print $2}' "$previous_metadata")
@@ -408,9 +419,7 @@ planned_jobs_for_bundle() {
     printf '%s\n' "$planned"
 }
 
-queue_user=${USER:-}
-[[ -n "$queue_user" ]] || queue_user=$(id -un)
-active_job_count=$(squeue -h -r -u "$queue_user" -o '%i' 2>/dev/null | awk 'NF {count++} END {print count + 0}')
+active_job_count=$(awk 'NF {count++} END {print count + 0}' <<< "$queue_snapshot")
 available_job_slots=$((max_user_jobs - job_headroom - active_job_count))
 minimum_pipeline_jobs=$(planned_jobs_for_bundle "$sample_count")
 if ((available_job_slots < minimum_pipeline_jobs)); then

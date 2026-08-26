@@ -8,6 +8,8 @@ All notable changes to this project are documented here.
   MitoHPC installation so compute jobs do not depend on login-node modules.
 - Fail workers early with a targeted setup error when a required bundled tool
   is unavailable, and include bundled bedtools in diagnostic reports.
+- Avoid silent resubmission exits when historical SLURM job IDs have expired by
+  comparing run records against a single active-queue snapshot.
 
 ## v0.1.1 — 2026-08-25
 

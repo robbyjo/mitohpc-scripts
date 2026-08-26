@@ -99,7 +99,8 @@ printf '%s\n' \
 
 printf '%s\n' \
     '#!/usr/bin/env bash' \
-    'for ((i = 0; i < ${SQUEUE_TEST_ACTIVE:-0}; i++)); do printf "%s\n" "$((9000 + i))"; done' \
+    'for argument in "$@"; do [[ "$argument" != -j ]] || exit 88; done' \
+    'for ((i = 0; i < ${SQUEUE_TEST_ACTIVE:-0}; i++)); do printf "%s|RUNNING\n" "$((9000 + i))"; done' \
     > "$TEST_DIR/bin/squeue"
 
 chmod +x "$TEST_DIR/mitohpc/scripts/"* "$TEST_DIR/mitohpc/bin/"* "$TEST_DIR/bin/"*
@@ -271,5 +272,19 @@ if PATH="$TEST_DIR/bin:$PATH" SLURM_ARRAY_TASK_ID=0 SLURM_JOB_ID=4003 \
     fail 'changed input provenance was accepted'
 fi
 assert_grep 'different inputs/settings' "$TEST_DIR/stale.stderr"
+
+# Expired SLURM job IDs can make `squeue -j ID` return nonzero. Resubmission
+# must compare historical IDs against a successful snapshot of the active queue
+# instead of querying each stale ID and exiting silently under pipefail.
+mkdir -p "$TEST_DIR/input-stale-job" "$TEST_DIR/out-stale-job/.mito-pipeline/runs/old"
+printf 'bam-data\n' > "$TEST_DIR/input-stale-job/stale.bam"
+printf 'index-data\n' > "$TEST_DIR/input-stale-job/stale.bam.bai"
+printf 'mitohpc_array_job\t99999999\n' > "$TEST_DIR/out-stale-job/.mito-pipeline/runs/old/run.txt"
+: > "$TEST_DIR/sbatch.log"
+PATH="$TEST_DIR/bin:$PATH" SBATCH_TEST_LOG="$TEST_DIR/sbatch.log" SBATCH_TEST_COUNTER="$TEST_DIR/sbatch.counter" \
+    "$ROOT/mito_pipeline.sh" "$TEST_DIR/input-stale-job" "$TEST_DIR/out-stale-job" \
+    --mitohpc-dir "$TEST_DIR/mitohpc" > "$TEST_DIR/stale-job.stdout"
+[[ $(wc -l < "$TEST_DIR/sbatch.log") -eq 2 ]] || fail 'stale historical job ID prevented resubmission'
+assert_grep 'Submitted 1 samples.' "$TEST_DIR/stale-job.stdout"
 
 printf 'PASS: pipeline integration tests\n'
