@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## Unreleased
+
+- Install a pinned, checksum-verified bedtools v2.30.0 executable inside the
+  MitoHPC installation so compute jobs do not depend on login-node modules.
+- Fail workers early with a targeted setup error when a required bundled tool
+  is unavailable, and include bundled bedtools in diagnostic reports.
+
 ## v0.1.1 — 2026-08-25
 
 - Automatically create missing BAM/CRAM indexes in a preliminary SLURM array.

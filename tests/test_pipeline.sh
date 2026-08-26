@@ -42,6 +42,7 @@ printf '%s\n' \
     '#!/usr/bin/env bash' \
     'set -Eeuo pipefail' \
     '[[ -s "$2.bai" || -s "$2.crai" ]]' \
+    '[[ "$(bedtools --version)" == "bedtools v2.30.0" ]]' \
     'mkdir -p "$(dirname -- "$3")"' \
     'printf "filter-called\\n" > "$3.filter-called"' \
     > "$TEST_DIR/mitohpc/scripts/filter.sh"
@@ -71,8 +72,10 @@ printf '%s\n' \
     'esac' \
     > "$TEST_DIR/bin/samtools"
 cp "$TEST_DIR/bin/samtools" "$TEST_DIR/mitohpc/bin/samtools"
-# A broken system samtools proves workers prefer MitoHPC's bundled executable.
+printf '%s\n' '#!/usr/bin/env bash' 'printf "bedtools v2.30.0\\n"' > "$TEST_DIR/mitohpc/bin/bedtools"
+# Broken system tools prove workers prefer MitoHPC's bundled executables.
 printf '%s\n' '#!/usr/bin/env bash' 'exit 99' > "$TEST_DIR/bin/samtools"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 99' > "$TEST_DIR/bin/bedtools"
 
 printf '%s\n' \
     '#!/usr/bin/env bash' \
@@ -99,7 +102,7 @@ printf '%s\n' \
     'for ((i = 0; i < ${SQUEUE_TEST_ACTIVE:-0}; i++)); do printf "%s\n" "$((9000 + i))"; done' \
     > "$TEST_DIR/bin/squeue"
 
-chmod +x "$TEST_DIR/mitohpc/scripts/"* "$TEST_DIR/mitohpc/bin/samtools" "$TEST_DIR/bin/"*
+chmod +x "$TEST_DIR/mitohpc/scripts/"* "$TEST_DIR/mitohpc/bin/"* "$TEST_DIR/bin/"*
 
 # Submission test: accepts the alternate sample.bai name, stages the canonical
 # name MitoHPC needs, and submits worker + summary + extraction.

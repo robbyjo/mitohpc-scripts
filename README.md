@@ -15,9 +15,11 @@ Run this on the Linux cluster login node:
 ```
 
 The installer uses the same pinned MitoHPC revision as the historical TOPMed
-workflow (`b172170323aa61dedbfb5f04002a732092843df5`) for reproducibility. It
-does **not** modify `~/.bashrc`. A different compatible checkout can be selected
-at run time with `--mitohpc-dir`.
+workflow (`b172170323aa61dedbfb5f04002a732092843df5`) for reproducibility and
+installs a checksum-verified bedtools v2.30.0 executable inside MitoHPC's own
+`bin/` directory. It does **not** modify `~/.bashrc` or require modules in batch
+jobs. A different compatible checkout can be selected at run time with
+`--mitohpc-dir`.
 
 Keep the complete repository on a filesystem visible from both the login and
 compute nodes, and do not move it while jobs are active. SLURM copies each batch
@@ -75,8 +77,9 @@ cluster needs modules or other site initialization, put those commands in a
 small shell file and pass `--prologue /path/to/cluster_env.sh`.
 
 Compute jobs automatically prefer tools installed in MitoHPC's `bin/`
-directory, including its bundled `samtools`. A cluster module or prologue is
-only needed when that bundled executable is absent or unusable.
+directory, including bundled `samtools` and `bedtools`. A cluster module or
+prologue is only needed for site-specific requirements outside the bundled
+toolchain.
 
 ## Extracting mitochondrial sequences
 

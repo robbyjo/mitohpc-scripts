@@ -165,6 +165,13 @@ if [[ -x "$bundled_samtools" ]]; then
 else
     printf 'MISSING_BUNDLED_SAMTOOLS=%s\n' "$bundled_samtools"
 fi
+bundled_bedtools="$pipeline_dir/software/MitoHPC/bin/bedtools"
+if [[ -x "$bundled_bedtools" ]]; then
+    printf 'bundled_bedtools=%s\n' "$bundled_bedtools"
+    show_command "$bundled_bedtools" --version
+else
+    printf 'MISSING_BUNDLED_BEDTOOLS=%s\n' "$bundled_bedtools"
+fi
 
 section 'Currently pending or running jobs'
 if command -v squeue >/dev/null 2>&1; then
@@ -260,6 +267,11 @@ if ! grep -q -- 'bundle_array.sh.*SCRIPT_DIR/slurm' "$pipeline_dir/mito_pipeline
     printf 'ACTION: replace the complete pipeline directory with Git commit 4e39d92 or newer\n'
 else
     printf 'PASS: installed launcher contains the shared-directory spool fix\n'
+fi
+if [[ -x "$pipeline_dir/software/MitoHPC/bin/bedtools" ]]; then
+    printf 'PASS: bundled bedtools is available to compute jobs\n'
+else
+    printf 'ACTION: rerun setup_mitohpc.sh to install bundled bedtools\n'
 fi
 
 section 'End'

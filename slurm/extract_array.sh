@@ -30,6 +30,7 @@ trap on_exit EXIT
 record_or_validate_attempt extract "$SAMPLE" "$EXTRACT_SIGNATURE" "$input_signature"
 
 initialize_mitohpc
+require_job_command samtools
 contig=$(detect_mt_contig "$ALIGNMENT" "$MT_CONTIG")
 reference=${REFERENCE_FASTA:-"$HP_RDIR/$HP_RNAME.fa"}
 [[ -s "$reference" ]] || job_die "reference FASTA not found: $reference (use --reference-fasta)"

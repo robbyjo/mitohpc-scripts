@@ -14,6 +14,9 @@ load_job_config "${2:-}"
 # initialize_mitohpc expects these manifest variables to exist.
 IFS=$'\t' read -r SAMPLE ALIGNMENT OUTPUT_PREFIX < "$MANIFEST"
 initialize_mitohpc
+if ((ITERATIONS > 0)); then
+    require_job_command bedtools
+fi
 
 printf 'Building cohort summaries for %s\n' "$OUTPUT_DIR"
 "$MITOHPC_SCRIPTS/getSummary.sh" "$OUTPUT_DIR"

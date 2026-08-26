@@ -5,6 +5,13 @@ job_die() {
     exit 1
 }
 
+require_job_command() {
+    local command_name=${1:-}
+    [[ -n "$command_name" ]] || job_die 'internal error: required command name is empty'
+    command -v "$command_name" >/dev/null 2>&1 || \
+        job_die "required compute command '$command_name' is unavailable; rerun setup_mitohpc.sh to install bundled prerequisites"
+}
+
 load_job_config() {
     (($# == 1)) || job_die 'internal error: expected config path'
     local config=$1

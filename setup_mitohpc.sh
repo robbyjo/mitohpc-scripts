@@ -4,9 +4,61 @@ IFS=$'\n\t'
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly DEFAULT_REVISION="b172170323aa61dedbfb5f04002a732092843df5"
+readonly BEDTOOLS_VERSION="2.30.0"
+readonly BEDTOOLS_SHA256="e85d74b6c11b664c05176b1dbf7d2891ad0383ae93805db2d29034db5c2d80ce"
+readonly BEDTOOLS_URL="https://github.com/arq5x/bedtools2/releases/download/v${BEDTOOLS_VERSION}/bedtools.static.binary"
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 log() { printf '[setup-mitohpc] %s\n' "$*" >&2; }
+
+install_bundled_bedtools() {
+    local bin_dir="$install_dir/bin" target="$install_dir/bin/bedtools"
+    local tmp="$install_dir/bin/.bedtools.${BEDTOOLS_VERSION}.$$" actual_sha version
+
+    if [[ -x "$target" ]]; then
+        version=$("$target" --version 2>/dev/null || true)
+        if [[ "$version" == "bedtools v$BEDTOOLS_VERSION" ]]; then
+            log "using bundled $version"
+            return
+        fi
+        log "replacing bundled bedtools with pinned v$BEDTOOLS_VERSION"
+    else
+        log "installing bundled bedtools v$BEDTOOLS_VERSION"
+    fi
+
+    [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] || \
+        die "the pinned bedtools binary requires Linux x86_64; install bedtools v$BEDTOOLS_VERSION at $target"
+    command -v sha256sum >/dev/null 2>&1 || die 'sha256sum is required to verify bedtools'
+    mkdir -p -- "$bin_dir"
+    rm -f -- "$tmp"
+    if command -v curl >/dev/null 2>&1; then
+        curl --fail --location --output "$tmp" "$BEDTOOLS_URL" || {
+            rm -f -- "$tmp"
+            die "failed to download bedtools from $BEDTOOLS_URL"
+        }
+    elif command -v wget >/dev/null 2>&1; then
+        wget -O "$tmp" "$BEDTOOLS_URL" || {
+            rm -f -- "$tmp"
+            die "failed to download bedtools from $BEDTOOLS_URL"
+        }
+    else
+        die 'curl or wget is required to download bedtools'
+    fi
+
+    actual_sha=$(sha256sum "$tmp" | awk '{print $1}')
+    if [[ "$actual_sha" != "$BEDTOOLS_SHA256" ]]; then
+        rm -f -- "$tmp"
+        die "bedtools checksum mismatch: expected $BEDTOOLS_SHA256, got $actual_sha"
+    fi
+    chmod 755 "$tmp"
+    version=$("$tmp" --version 2>/dev/null || true)
+    if [[ "$version" != "bedtools v$BEDTOOLS_VERSION" ]]; then
+        rm -f -- "$tmp"
+        die "downloaded bedtools failed its version check: ${version:-no output}"
+    fi
+    mv -f -- "$tmp" "$target"
+    log "installed $version at $target"
+}
 
 usage() {
     cat <<EOF
@@ -78,9 +130,15 @@ set +u
 # shellcheck disable=SC1091
 source ./init.sh
 set -u
+# Upstream's installer skips bedtools whenever one is visible in the login-node
+# environment. Install a pinned private copy first so compute jobs never depend
+# on an interactive module or inherited PATH.
+install_bundled_bedtools
 ./install_prerequisites.sh
 ./checkInstall.sh
 [[ -f checkInstall.log ]] && cat checkInstall.log
 [[ -x "$install_dir/bin/samtools" ]] || \
     die "MitoHPC setup did not install its bundled samtools: $install_dir/bin/samtools"
+[[ -x "$install_dir/bin/bedtools" ]] || \
+    die "MitoHPC setup did not install its bundled bedtools: $install_dir/bin/bedtools"
 log 'MitoHPC setup complete'

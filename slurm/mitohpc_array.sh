@@ -71,6 +71,10 @@ trap on_exit EXIT
 record_or_validate_attempt mitohpc "$SAMPLE" "$MITOHPC_SIGNATURE" "$input_signature"
 
 initialize_mitohpc
+require_job_command samtools
+if ((ITERATIONS > 0)); then
+    require_job_command bedtools
+fi
 export HP_RMT="$(detect_mt_contig "$ALIGNMENT" "$MT_CONTIG")"
 mkdir -p -- "$(dirname -- "$OUTPUT_PREFIX")"
 
