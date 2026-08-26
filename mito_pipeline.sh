@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-readonly VERSION="0.1.1"
+readonly VERSION="0.2.0"
 
 die() {
     printf 'ERROR: %s\n' "$*" >&2
