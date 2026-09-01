@@ -346,11 +346,311 @@ checks. The cohort summary is rebuilt only after every array task succeeds.
 Inspect `OUTPUT/.mito-pipeline/status/*/*.failed` and the corresponding log for
 failures.
 
+### Check for incomplete results
+
+An empty `squeue` or `qstat` only means that no jobs are currently visible; it
+does not distinguish successful jobs from jobs that already failed. First check
+whether this workflow still has active jobs:
+
+```bash
+# SLURM
+squeue -u "$USER"
+
+# Open Grid Scheduler / Grid Engine
+qstat -u "$USER"
+```
+
+After the jobs have left the queue, use the latest immutable run manifest and
+the pipeline's status markers to validate every expected sample. The following
+block prints the missing or failed sample names and exits nonzero unless all
+requested stages and their minimum output files are complete. It runs in a
+subshell, so it will not close an interactive login shell:
+
+```bash
+(
+OUTPUT=/path/to/results
+
+RUN=$(find "$OUTPUT/.mito-pipeline/runs" -mindepth 1 -maxdepth 1 -type d \
+  -printf '%T@\t%p\n' | sort -nr | head -n 1 | cut -f 2-)
+[[ -n "$RUN" && -s "$RUN/samples.tsv" && -s "$RUN/run.txt" ]] || {
+  echo "ERROR: no completed run manifest found under $OUTPUT" >&2
+  exit 1
+}
+
+MANIFEST="$RUN/samples.tsv"
+STATUS="$OUTPUT/.mito-pipeline/status"
+CHECK_TMP=$(mktemp -d)
+trap 'rm -rf -- "$CHECK_TMP"' EXIT
+cut -f 1 "$MANIFEST" | LC_ALL=C sort -u > "$CHECK_TMP/expected"
+
+check_stage() {
+  stage=$1
+  find "$STATUS/$stage" -maxdepth 1 -type f -name '*.ok' -printf '%f\n' \
+    | sed 's/[.]ok$//' | LC_ALL=C sort -u > "$CHECK_TMP/$stage.ok"
+  find "$STATUS/$stage" -maxdepth 1 -type f -name '*.failed' -printf '%f\n' \
+    | sed 's/[.]failed$//' | LC_ALL=C sort -u > "$CHECK_TMP/$stage.failed"
+  comm -23 "$CHECK_TMP/expected" "$CHECK_TMP/$stage.ok" \
+    > "$CHECK_TMP/$stage.missing"
+  comm -12 "$CHECK_TMP/expected" "$CHECK_TMP/$stage.failed" \
+    > "$CHECK_TMP/$stage.failed-current"
+
+  bad=0
+  if [[ -s "$CHECK_TMP/$stage.missing" ]]; then
+    echo "Missing $stage results:"
+    sed 's/^/  /' "$CHECK_TMP/$stage.missing"
+    bad=1
+  fi
+  if [[ -s "$CHECK_TMP/$stage.failed-current" ]]; then
+    echo "Failed $stage results:"
+    sed 's/^/  /' "$CHECK_TMP/$stage.failed-current"
+    bad=1
+  fi
+  return "$bad"
+}
+
+rc=0
+if grep -q $'^mitohpc_array_job\t' "$RUN/run.txt"; then
+  check_stage mitohpc || rc=1
+  : > "$CHECK_TMP/mitohpc-files-missing"
+  while IFS=$'\t' read -r sample alignment output_prefix; do
+    [[ -s "$output_prefix.count" ]] || \
+      printf '%s\n' "$sample" >> "$CHECK_TMP/mitohpc-files-missing"
+  done < "$MANIFEST"
+  if [[ -s "$CHECK_TMP/mitohpc-files-missing" ]]; then
+    echo 'Samples missing a nonempty MitoHPC .count file:'
+    sed 's/^/  /' "$CHECK_TMP/mitohpc-files-missing"
+    rc=1
+  fi
+  if [[ ! -s "$STATUS/summary.ok" ]]; then
+    echo 'Missing cohort summary success marker' >&2
+    rc=1
+  fi
+fi
+
+if grep -q $'^extract_array_job\t' "$RUN/run.txt"; then
+  check_stage extract || rc=1
+  : > "$CHECK_TMP/extract-files-missing"
+  while IFS=$'\t' read -r sample alignment output_prefix; do
+    [[ -s "$OUTPUT/extracted/$sample.cram" && \
+       -s "$OUTPUT/extracted/$sample.cram.crai" ]] || \
+      printf '%s\n' "$sample" >> "$CHECK_TMP/extract-files-missing"
+  done < "$MANIFEST"
+  if [[ -s "$CHECK_TMP/extract-files-missing" ]]; then
+    echo 'Samples missing a nonempty extracted CRAM or CRAI:'
+    sed 's/^/  /' "$CHECK_TMP/extract-files-missing"
+    rc=1
+  fi
+fi
+
+if ! grep -Eq $'^(mitohpc_array_job|extract_array_job)\t' "$RUN/run.txt"; then
+  echo 'ERROR: latest run has no submitted analysis or extraction jobs' >&2
+  rc=1
+fi
+
+if ((rc == 0)); then
+  echo "COMPLETE: $(wc -l < "$CHECK_TMP/expected") samples validated"
+else
+  echo 'INCOMPLETE: inspect the listed samples and OUTPUT/logs' >&2
+fi
+exit "$rc"
+)
+```
+
+The cohort `summary.ok` marker is written only after MitoHPC verifies current
+success markers for every manifest sample and the summary command exits zero.
+Extraction is checked separately because it is allowed to finish independently
+of cohort summarization. After correcting a failure, rerun the original
+launcher command; valid samples will be skipped.
+
+For historical scheduler details, collect the job IDs from the latest
+`run.txt`. On SLURM, pass the comma-separated IDs to `sacct -X -j`; on Grid
+Engine, inspect each with `qacct -j`. The diagnostic report shown above does
+this automatically when the relevant accounting command is available.
+
+### Package a validated result set
+
+Run the validation block above immediately before packaging and continue only
+after it prints `COMPLETE`. Create the archive outside `OUTPUT`; otherwise tar
+may try to include the archive while it is still being written. This recipe
+keeps scientific outputs, logs, manifests, and status records, but omits
+`.mito-pipeline/alignments`, which contains staging links and any regenerated
+input indexes rather than final results:
+
+```bash
+(
+set -euo pipefail
+OUTPUT=/path/to/results
+PACKAGE_DIR=/path/to/packages
+
+mkdir -p "$PACKAGE_DIR"
+OUTPUT=$(cd "$OUTPUT" && pwd -P)
+PACKAGE_DIR=$(cd "$PACKAGE_DIR" && pwd -P)
+case "$PACKAGE_DIR/" in
+  "$OUTPUT/"*)
+    echo 'ERROR: PACKAGE_DIR must be outside OUTPUT' >&2
+    exit 1
+    ;;
+esac
+OUTPUT_PARENT=$(dirname "$OUTPUT")
+OUTPUT_NAME=$(basename "$OUTPUT")
+STAMP=$(date -u +'%Y%m%dT%H%M%SZ')
+ARCHIVE="$PACKAGE_DIR/${OUTPUT_NAME}_${STAMP}.tar.gz"
+
+# Do not use tar --dereference: staged alignments point to the original inputs.
+tar -C "$OUTPUT_PARENT" \
+  --exclude="$OUTPUT_NAME/.mito-pipeline/alignments" \
+  -czf "$ARCHIVE" "$OUTPUT_NAME"
+tar -tzf "$ARCHIVE" > "$ARCHIVE.contents.txt"
+(
+  cd "$PACKAGE_DIR"
+  sha256sum "$(basename "$ARCHIVE")" > "$(basename "$ARCHIVE").sha256"
+  sha256sum -c "$(basename "$ARCHIVE").sha256"
+)
+
+printf 'Archive:  %s\nContents: %s\nChecksum: %s\n' \
+  "$ARCHIVE" "$ARCHIVE.contents.txt" "$ARCHIVE.sha256"
+)
+```
+
+Retain the `.sha256` and `.contents.txt` files beside the archive. On the
+receiving system, place all three files in one directory and run
+`sha256sum -c ARCHIVE_NAME.tar.gz.sha256` before extracting. Use
+`tar -xzf ARCHIVE_NAME.tar.gz` to unpack it. For very large result sets, verify
+that `PACKAGE_DIR` has enough free space with `df -h "$PACKAGE_DIR"` first.
+
 The workflow records signatures for the alignment, its index, MitoHPC code, and
 scientifically relevant options. If an input or analysis setting changes after
 work has begun, the run stops instead of mixing incompatible results. Use a new
 output directory for the changed analysis. A second submission is also blocked
 while an earlier MitoHPC array for that output directory is still active.
+
+## Troubleshooting
+
+### Start with evidence, not another large submission
+
+Test changes with `--dry-run` and then a directory containing no more than five
+alignments before resubmitting a cohort. For an existing run, create the
+read-only diagnostic report first:
+
+```bash
+PIPELINE=/path/to/mitohpc-scripts
+OUTPUT=/path/to/results
+
+bash "$PIPELINE/diagnose_mitohpc.sh" "$PIPELINE" "$OUTPUT"
+```
+
+Then find the latest run record, failed markers, and newest nonempty logs:
+
+```bash
+RUN=$(find "$OUTPUT/.mito-pipeline/runs" -mindepth 1 -maxdepth 1 -type d \
+  -printf '%T@\t%p\n' | sort -nr | head -n 1 | cut -f 2-)
+printf 'Latest run: %s\n' "$RUN"
+cat "$RUN/run.txt"
+find "$OUTPUT/.mito-pipeline/status" -type f -name '*.failed' -print
+find "$OUTPUT/logs" -type f -size +0c -printf '%T@\t%p\n' \
+  | sort -nr | head -n 20 | cut -f 2-
+```
+
+An empty live queue is not proof of success. Use the job IDs stored in
+`run.txt` to query scheduler history:
+
+```bash
+JOB_IDS=$(awk -F '\t' \
+  '$1 ~ /^(index_array_job|mitohpc_array_job|extract_array_job|summary_job)$/ \
+   && $2 ~ /^[0-9]+$/ {print $2}' "$RUN/run.txt" | paste -sd, -)
+printf 'Job IDs: %s\n' "${JOB_IDS:-none}"
+```
+
+For SLURM:
+
+```bash
+sacct -X -j "$JOB_IDS" \
+  --format=JobIDRaw,JobName,Partition,State,ExitCode,Elapsed,Reason
+```
+
+For Open Grid Scheduler / Grid Engine, `qacct` accepts one job at a time:
+
+```bash
+tr ',' '\n' <<< "$JOB_IDS" | while read -r job_id; do
+  qacct -j "$job_id"
+done
+```
+
+The completion checker in the previous section remains authoritative after
+scheduler accounting records expire.
+
+### Common symptoms
+
+| Symptom | Likely cause and action |
+| --- | --- |
+| `sbatch: Invalid job array specification` | The requested array is larger than the site's limit. Use the current launcher with `--max-array-size` no larger than `MaxArraySize`; it splits the cohort automatically. On Biowulf, `--max-array-size 1000 --max-parallel 20` produces arrays such as `0-999%20`. |
+| `AssocMaxSubmitJobLimit` or a QOS submit-limit error | Running and pending array elements exhausted the user or association quota. Wait for capacity, set `--max-user-jobs` to the real site limit, and retain headroom. The launcher then bundles samples automatically; lowering only `--max-parallel` does not reduce submitted elements. |
+| Jobs vanish from `squeue` or `qstat` | Completed and failed jobs normally leave the live queue. Check `sacct` or `qacct`, `.failed` markers, and task logs. Do not immediately submit the full cohort again. |
+| Thousands of jobs fail within seconds | Usually a shared-path, missing-helper, command, permission, or configuration failure affecting every task. Stop further large submissions, reproduce with at most five samples, and inspect the first task's `.err` log. |
+| `/var/spool/.../job_common.sh: No such file or directory` | An obsolete worker tried to find helpers beside the scheduler's temporary script copy. Keep the complete repository on a compute-visible filesystem and submit through a current top-level launcher; do not invoke or copy an individual file from `slurm/` or `ogs/`. |
+| `required compute command 'samtools' is unavailable` | Rerun `setup_mitohpc.sh` if the bundled tools are absent. If the site requires modules, load them through `--prologue` so loading occurs inside every compute job. |
+| `existing ... outputs ... were made from different inputs/settings` | The output directory contains provenance from another alignment, index, reference, MitoHPC revision, or scientific option set. Use a new output directory; do not delete individual `.attempt` or `.ok` markers to bypass this check. |
+| `job ... is still ... for this output directory` | An earlier array using the same output directory remains active. Wait for it to finish. Use a different output directory only for a genuinely separate analysis. |
+| `refusing cohort summary: ... sample(s) are incomplete` | At least one MitoHPC marker is missing or stale. Inspect the listed samples and logs, correct the underlying issue, and rerun the original launcher command. Successful samples will be skipped. |
+| `could not identify the qsub implementation` | Capture `qstat --version 2>&1`. OGS/GE 2011.11 is supported even when that command returns nonzero; PBS Pro, OpenPBS, and Torque are intentionally rejected because their syntax differs. |
+| Grid Engine reports an unknown PE, resource, or queue | Inspect `qconf -spl`, `qconf -sc`, and `qconf -sql`, then set `--parallel-env`, `--memory-resource`, `--time-resource`, and `--queue` to site-valid names. |
+| No BAM/CRAM files are found | Inputs are searched only at the top level by default. Add `--recursive` for nested directories and confirm filenames end in `.bam` or `.cram`. |
+| `could not detect a mitochondrial contig with mapped reads` | Check `samtools idxstats` for the sample and pass the correct name with `--mt-contig`, commonly `chrM`, `MT`, or `M`. Also confirm the file actually contains mapped mitochondrial reads. |
+| CRAM decoding or extraction reports reference errors | Pass the exact reference used to create the CRAM with `--reference-fasta`; verify it is readable and has a matching `.fai`. A reference with the same contig names but different sequence is not interchangeable. |
+| `TIMEOUT`, `OUT_OF_MEMORY`, or disk-write errors | Inspect scheduler accounting and logs. Increase `--time` only within the selected queue/partition limit; adjust `--memory` or `--tool-memory` for memory failures; check `df -h`, quota, and output permissions for write failures. |
+
+### Compute-node commands and modules
+
+`module load samtools` in the login shell before submission is not sufficient on
+clusters that start batch jobs with a clean environment. The preferred setup is
+the pinned `software/MitoHPC/bin/samtools` installed by:
+
+```bash
+./setup_mitohpc.sh
+software/MitoHPC/bin/samtools --version
+```
+
+If local policy requires a module, create a readable prologue file:
+
+```bash
+#!/usr/bin/env bash
+module load samtools
+```
+
+Then submit it with the original command:
+
+```bash
+./mito_pipeline_auto.sh INPUT OUTPUT --prologue /path/to/cluster_env.sh
+```
+
+The prologue is sourced inside indexing, analysis, extraction, and summary
+jobs. Bundled tools under MitoHPC's `bin/` directory are placed first in
+`PATH`, making runs independent of whichever modules happened to be loaded at
+submission time.
+
+### Shared paths, permissions, and versions
+
+The repository, MitoHPC installation, input files, output directory, reference,
+and optional prologue must be visible from compute nodes. Do not move or rename
+the repository while jobs are active. Paths to the repository, MitoHPC, and
+output directory must not contain whitespace.
+
+Before a large retry, record the exact repository state and verify its scripts:
+
+```bash
+git -C /path/to/mitohpc-scripts status --short --branch
+git -C /path/to/mitohpc-scripts describe --tags --always --dirty
+bash -n /path/to/mitohpc-scripts/*.sh \
+  /path/to/mitohpc-scripts/slurm/*.sh \
+  /path/to/mitohpc-scripts/ogs/*.sh
+```
+
+If the checkout is clean but behind GitHub, update it with `git pull --ff-only`.
+If it has local changes, preserve or commit them before updating rather than
+overwriting them. A useful support bundle contains the diagnostic report, exact
+launcher command, relevant `.failed` marker, matching `.err`/`.out` log, and
+scheduler accounting output. Review usernames, hostnames, job IDs, and paths
+before sharing; never include alignment contents or credentials.
 
 ## Deliberate safety checks
 
